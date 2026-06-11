@@ -1,3 +1,3 @@
-# nothing to ignore yet — the rendered ~/.local/bin/maxclaude-pane lives outside
-# the repo. Keep this file so the directory layout is obvious.
+# Nothing generated lands in the repo: rendered profiles and session metadata
+# live under ~/.config/maxagent. Keep this file so the layout is obvious.
 *.swp
