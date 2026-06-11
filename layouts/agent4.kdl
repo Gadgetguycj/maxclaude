@@ -1,4 +1,4 @@
-// maxclaude 4 — four persistent Claude panes in a 2x2 grid.
+// maxagent 4 — four persistent agent panes in a 2x2 grid.
 layout {
     default_tab_template {
         pane size=1 borderless=true {
@@ -9,19 +9,19 @@ layout {
             plugin location="compact-bar"
         }
     }
-    pane_template name="cc" {
+    pane_template name="agent" {
         command "bash"
-        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+        args "-lc" "exec $HOME/.local/bin/maxagent-pane"
     }
-    tab name="claude" focus=true {
+    tab name="agent" focus=true {
         pane split_direction="horizontal" {
             pane split_direction="vertical" {
-                cc
-                cc
+                agent
+                agent
             }
             pane split_direction="vertical" {
-                cc
-                cc
+                agent
+                agent
             }
         }
     }

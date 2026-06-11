@@ -1,0 +1,15 @@
+[Unit]
+Description=Persistent agent zellij workspace (named %I)
+Documentation=man:zellij(1)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+Environment=TERM=xterm-256color
+Environment=COLORTERM=truecolor
+ExecStart=%h/.local/bin/maxagent-svc start %I
+ExecStop=%h/.local/bin/maxagent-svc stop %I
+
+# No [Install] section: sessions should survive disconnects, not respawn on reboot.
