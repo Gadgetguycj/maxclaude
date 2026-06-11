@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -x "$DIR/maxagent" ]; then
+  echo "maxcodex: maxagent not found at $DIR/maxagent. Re-run the installer (install.sh)." >&2
+  exit 127
+fi
 export MAXAGENT_DEFAULT_PROVIDER=codex
 export MAXAGENT_APP=maxcodex
 exec "$DIR/maxagent" "$@"
