@@ -34,6 +34,7 @@ CODEX_APPROVAL=""
 CODEX_DANGEROUS=""
 ASSUME_YES=""
 WANT_SYSTEMD="auto"
+PROVIDER_EXPLICIT=""
 
 BIN_DIR="$HOME/.local/bin"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -65,22 +66,38 @@ shell_quote(){
   printf "'%s'" "$(printf '%s' "$s" | sed "s/'/'\\\\''/g")"
 }
 
+# Render each argument as a single shell-quoted token, space-separated, for
+# embedding into a generated bash array literal: foo=( $(quote_tokens a b) ).
+quote_tokens(){
+  local t out=""
+  for t in "$@"; do out="$out $(shell_quote "$t")"; done
+  printf '%s' "${out# }"
+}
+
 find_exe(){
-  local name="$1" found=""
+  local name="$1" found="" c v
   found="$(command -v "$name" 2>/dev/null || true)"
   if [ -z "$found" ]; then
-    found="$(bash -lc "command -v $name" 2>/dev/null || true)"
+    found="$(bash -lc 'command -v "$1"' _ "$name" 2>/dev/null || true)"
   fi
   if [ -z "$found" ] && [ "$name" = "codex" ]; then
-    found="$(find "$HOME/.nvm/versions/node" -maxdepth 4 -name codex -perm -111 2>/dev/null | sort -Vr | head -1 || true)"
+    # Pick the newest nvm-installed codex without relying on GNU `sort -V`.
+    # Tag each path with its vX.Y.Z and numeric-sort by major/minor/patch.
+    found="$(
+      for c in "$HOME"/.nvm/versions/node/v*/bin/codex; do
+        [ -x "$c" ] || continue
+        v="${c#*/node/v}"; v="${v%%/*}"
+        printf '%s\t%s\n' "$v" "$c"
+      done 2>/dev/null | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 | cut -f2 || true
+    )"
   fi
   printf '%s\n' "$found"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --provider) shift; DEFAULT_PROVIDER="${1:?--provider needs codex or claude}" ;;
-    --provider=*) DEFAULT_PROVIDER="${1#*=}" ;;
+    --provider) shift; DEFAULT_PROVIDER="${1:?--provider needs codex or claude}"; PROVIDER_EXPLICIT=1 ;;
+    --provider=*) DEFAULT_PROVIDER="${1#*=}"; PROVIDER_EXPLICIT=1 ;;
     --workdir) shift; WORKDIR="${1:?--workdir needs a directory}" ;;
     --workdir=*) WORKDIR="${1#*=}" ;;
     --codex-profile) shift; CODEX_PROFILE="${1:?--codex-profile needs a value}" ;;
@@ -105,6 +122,26 @@ done
 case "$DEFAULT_PROVIDER" in codex|claude) ;; *) die "--provider must be codex or claude" ;; esac
 case "$CODEX_SANDBOX" in ""|read-only|workspace-write|danger-full-access) ;; *) die "--codex-sandbox must be read-only, workspace-write, or danger-full-access" ;; esac
 case "$CODEX_APPROVAL" in ""|untrusted|on-request|never) ;; *) die "--codex-approval must be untrusted, on-request, or never" ;; esac
+if [ -n "$CODEX_DANGEROUS" ] && { [ -n "$CODEX_SANDBOX" ] || [ -n "$CODEX_APPROVAL" ]; }; then
+  die "--codex-dangerous-bypass cannot be combined with --codex-sandbox or --codex-approval (Codex rejects the mix)"
+fi
+
+# Preserve the existing default provider on re-install unless --provider was
+# given. A prior Claude-only "maxclaude" install (no ~/.config/maxagent) keeps
+# defaulting to Claude instead of silently flipping to Codex.
+PREV_PROVIDER=""
+[ -r "$AGENT_CFG_DIR/defaults.env" ] && \
+  PREV_PROVIDER="$(. "$AGENT_CFG_DIR/defaults.env" 2>/dev/null; printf '%s' "${MAXAGENT_DEFAULT_PROVIDER:-}")"
+if [ -z "$PROVIDER_EXPLICIT" ]; then
+  if [ -n "$PREV_PROVIDER" ]; then
+    DEFAULT_PROVIDER="$PREV_PROVIDER"
+  elif [ -d "$CFG_DIR/maxclaude" ]; then
+    DEFAULT_PROVIDER="claude"
+  fi
+elif [ -n "$PREV_PROVIDER" ] && [ "$PREV_PROVIDER" != "$DEFAULT_PROVIDER" ]; then
+  warn "default provider changes from '$PREV_PROVIDER' to '$DEFAULT_PROVIDER' (bare 'maxagent' will now launch $DEFAULT_PROVIDER)"
+fi
+case "$DEFAULT_PROVIDER" in codex|claude) ;; *) DEFAULT_PROVIDER="codex" ;; esac
 
 SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
 have_sources(){ [ -f "$SRC_DIR/bin/maxagent" ] && [ -d "$SRC_DIR/layouts" ]; }
@@ -153,7 +190,7 @@ install_zellij_from_release(){
   [ -n "$zarch" ] && [ -n "$zplat" ] || die "no zellij prebuilt for $uname_s/$uname_m — install zellij manually then re-run"
   local asset="zellij-${zarch}-${zplat}.tar.gz" url tmp
   url="https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/${asset}"
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
   say "  downloading $asset ($ZELLIJ_VERSION)..."
   if command -v curl >/dev/null 2>&1; then curl -fL# "$url" -o "$tmp/z.tgz"
   elif command -v wget >/dev/null 2>&1; then wget -q --show-progress -O "$tmp/z.tgz" "$url"
@@ -194,7 +231,7 @@ if [ ! -d "$WORKDIR" ]; then
   ans="$(ask "Directory '$WORKDIR' does not exist. Create it? [Y/n] " "Y")"
   case "$ans" in [Nn]*) WORKDIR="$HOME" ;; *) mkdir -p "$WORKDIR" || WORKDIR="$HOME" ;; esac
 fi
-if [ -z "$CLAUDE_MODE_FORCED" ]; then
+if [ -z "$CLAUDE_MODE_FORCED" ] && { [ "$DEFAULT_PROVIDER" = "claude" ] || [ -n "$CLAUDE_BIN" ]; }; then
   say ""
   say "  ${c_bold}Claude --dangerously-skip-permissions${c_off}"
   say "  ${c_dim}Only affects Claude panes. Codex uses safe interactive defaults unless Codex flags are passed.${c_off}"
@@ -208,15 +245,18 @@ install -m 0755 "$SRC_DIR/bin/maxcodex" "$BIN_DIR/maxcodex"
 install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
-install -m 0755 "$SRC_DIR/bin/maxclaude-svc" "$BIN_DIR/maxclaude-svc"
+# Drop artifacts from older maxclaude installs that this layout no longer uses
+# (maxclaude-svc is now just maxagent-svc; the per-pane launcher is maxagent-pane).
+rm -f "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
 ok "commands  -> $BIN_DIR/maxagent, maxcodex, maxclaude"
 
 mkdir -p "$LAYOUT_DIR"
 install -m 0644 "$SRC_DIR"/layouts/agent{1,2,3,4}.kdl "$LAYOUT_DIR/"
-install -m 0644 "$SRC_DIR"/layouts/cc{1,2,3,4}.kdl "$LAYOUT_DIR/"
-ok "layouts   -> $LAYOUT_DIR/agent{1,2,3,4}.kdl (+ legacy cc{1,2,3,4})"
+rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
+ok "layouts   -> $LAYOUT_DIR/agent{1,2,3,4}.kdl"
 
-mkdir -p "$PROFILE_DIR" "$SESSION_DIR"
+mkdir -p "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR"
+chmod 0700 "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR" 2>/dev/null || true
 workdir_q="$(shell_quote "$WORKDIR")"
 codex_cmd="codex"
 codex_path_line="# codex found on PATH"
@@ -225,58 +265,77 @@ if [ -n "$CODEX_BIN" ]; then
   codex_dir="$(dirname "$CODEX_BIN")"
   codex_path_line="export PATH=$(shell_quote "$codex_dir"):\$PATH"
 fi
-codex_extra=""
-[ -n "$CODEX_PROFILE" ] && codex_extra="$codex_extra --profile $(shell_quote "$CODEX_PROFILE")"
-[ -n "$CODEX_SANDBOX" ] && codex_extra="$codex_extra --sandbox $(shell_quote "$CODEX_SANDBOX")"
-[ -n "$CODEX_APPROVAL" ] && codex_extra="$codex_extra --ask-for-approval $(shell_quote "$CODEX_APPROVAL")"
-[ -n "$CODEX_DANGEROUS" ] && codex_extra="$codex_extra --dangerously-bypass-approvals-and-sandbox"
+# Codex flags split into two groups:
+#   common  - safe to pass in every mode (e.g. --profile)
+#   extra   - only for normal (non-yolo) mode: --sandbox / --ask-for-approval /
+#             an explicitly requested bypass. These are dropped in --yolo mode
+#             because --dangerously-bypass-approvals-and-sandbox is mutually
+#             exclusive with them (Codex exits on the combination).
+codex_common=()
+[ -n "$CODEX_PROFILE" ] && codex_common+=(--profile "$CODEX_PROFILE")
+codex_extra=()
+[ -n "$CODEX_SANDBOX" ] && codex_extra+=(--sandbox "$CODEX_SANDBOX")
+[ -n "$CODEX_APPROVAL" ] && codex_extra+=(--ask-for-approval "$CODEX_APPROVAL")
+[ -n "$CODEX_DANGEROUS" ] && codex_extra+=(--dangerously-bypass-approvals-and-sandbox)
+codex_common_q="$(quote_tokens ${codex_common[@]+"${codex_common[@]}"})"
+codex_extra_q="$(quote_tokens ${codex_extra[@]+"${codex_extra[@]}"})"
 cat > "$PROFILE_DIR/codex.sh" <<EOF
 #!/usr/bin/env bash
 $codex_path_line
 cd $workdir_q 2>/dev/null || cd "\$HOME" || true
+common=($codex_common_q)
+extra=($codex_extra_q)
 if [ -n "\${MAXAGENT_YOLO:-}" ]; then
-  exec $codex_cmd --dangerously-bypass-approvals-and-sandbox --cd $workdir_q$codex_extra "\$@"
+  exec $codex_cmd --dangerously-bypass-approvals-and-sandbox --cd $workdir_q \${common[@]+"\${common[@]}"} "\$@"
 fi
-exec $codex_cmd --cd $workdir_q$codex_extra "\$@"
+exec $codex_cmd --cd $workdir_q \${common[@]+"\${common[@]}"} \${extra[@]+"\${extra[@]}"} "\$@"
 EOF
-chmod 0755 "$PROFILE_DIR/codex.sh"
+chmod 0700 "$PROFILE_DIR/codex.sh"
 
 claude_env="# normal permission prompts"
-claude_flags=""
+claude_flags_q=""
 claude_cmd="claude"
 if [ -n "$CLAUDE_BIN" ]; then
   claude_cmd="$(shell_quote "$CLAUDE_BIN")"
 fi
 if [ -n "$CLAUDE_YOLO" ]; then
-  claude_env="export IS_SANDBOX=1"
-  claude_flags=" --dangerously-skip-permissions"
+  # IS_SANDBOX=1 lets Claude accept --dangerously-skip-permissions (e.g. as root).
+  claude_env=$'# IS_SANDBOX=1 lets Claude accept --dangerously-skip-permissions (e.g. as root)\nexport IS_SANDBOX=1'
+  claude_flags_q="$(quote_tokens --dangerously-skip-permissions)"
 fi
 cat > "$PROFILE_DIR/claude.sh" <<EOF
 #!/usr/bin/env bash
 $claude_env
 cd $workdir_q 2>/dev/null || cd "\$HOME" || true
-claude_flags="$claude_flags"
+flags=($claude_flags_q)
 if [ -n "\${MAXAGENT_YOLO:-}" ]; then
   export IS_SANDBOX=1
-  case " \$claude_flags " in *" --dangerously-skip-permissions "*) ;; *) claude_flags="\$claude_flags --dangerously-skip-permissions" ;; esac
+  _has=""
+  for _f in \${flags[@]+"\${flags[@]}"}; do [ "\$_f" = "--dangerously-skip-permissions" ] && _has=1; done
+  [ -n "\$_has" ] || flags+=(--dangerously-skip-permissions)
 fi
-exec $claude_cmd \$claude_flags "\$@"
+exec $claude_cmd \${flags[@]+"\${flags[@]}"} "\$@"
 EOF
-chmod 0755 "$PROFILE_DIR/claude.sh"
+chmod 0700 "$PROFILE_DIR/claude.sh"
 ok "profiles  -> $PROFILE_DIR/{codex,claude}.sh"
 
-cat > "$AGENT_CFG_DIR/defaults.env" <<EOF
+( umask 077; cat > "$AGENT_CFG_DIR/defaults.env" <<EOF
 MAXAGENT_DEFAULT_PROVIDER=$(shell_quote "$DEFAULT_PROVIDER")
 MAXAGENT_WORKDIR=$(shell_quote "$WORKDIR")
 EOF
+)
 
 if [ -n "$USE_SYSTEMD" ]; then
   mkdir -p "$UNIT_DIR"
   install -m 0644 "$SRC_DIR/systemd/maxagent-named@.service" "$UNIT_DIR/"
-  install -m 0644 "$SRC_DIR/systemd/maxclaude@.service" "$UNIT_DIR/"
-  install -m 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
+  # Remove legacy units from older installs: every session now runs under
+  # maxagent-named@; maxagent still stops any pre-existing maxclaude@ units.
+  # Deliberately NOT stopped here: the old units' ExecStop deletes the zellij
+  # session, so stopping live ones mid-upgrade would kill running sessions.
+  # Any leftover ghost unit is cleaned by 'maxagent close' / 'maxagent prune'.
+  rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
   systemctl --user daemon-reload 2>/dev/null || true
-  ok "services  -> $UNIT_DIR/maxagent-named@.service (+ legacy maxclaude units)"
+  ok "services  -> $UNIT_DIR/maxagent-named@.service"
   if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
     warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"
   else

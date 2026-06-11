@@ -19,10 +19,12 @@ LEGACY_CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
 DEFAULT_PROVIDER="${MAXAGENT_DEFAULT_PROVIDER:-codex}"
 SESSION_PREFIX="${MAXAGENT_SESSION_PREFIX:-}"
 
-if [ -r "$CONFIG_ROOT/defaults.env" ]; then
+if [ -z "${MAXAGENT_DEFAULT_PROVIDER:-}" ] && [ -r "$CONFIG_ROOT/defaults.env" ]; then
+  # Read the configured default in a subshell so the file's other variables
+  # don't leak into this process (and from here into every pane).
   # shellcheck disable=SC1090
-  . "$CONFIG_ROOT/defaults.env"
-  DEFAULT_PROVIDER="${MAXAGENT_DEFAULT_PROVIDER:-$DEFAULT_PROVIDER}"
+  _dp="$(. "$CONFIG_ROOT/defaults.env" 2>/dev/null; printf '%s' "${MAXAGENT_DEFAULT_PROVIDER:-}")"
+  case "$_dp" in codex|claude) DEFAULT_PROVIDER="$_dp" ;; esac
 fi
 
 case "$APP" in
@@ -50,12 +52,15 @@ _usage(){
 $APP — persistent Codex/Claude panes in zellij
 
 Usage:
-  $APP [codex|claude] [1|2|3|4] [--yolo]
-  $APP [codex|claude] <name> [1|2|3|4] [--yolo]
+  $APP [codex|claude] [1|2|3|4] [--yolo|--safe]
+  $APP [codex|claude] <name> [1|2|3|4] [--yolo|--safe]
   $APP ls
   $APP attach <number|name>
   $APP close <number|name|all>
   $APP prune
+
+Note: 'codex' and 'claude' are provider selectors, so they cannot be used as
+workspace names. Pick another name (e.g. '$APP codex work').
 EOF
 }
 
@@ -95,8 +100,11 @@ _session_for(){
     1|2|3|4) printf '%s%s\n' "$provider" "$sel" ;;
     *)
       safe="$(_sanitize "$sel")" || return 1
+      # Only pass through names already in THIS provider's namespace; another
+      # provider's numbered form (e.g. "codex4" requested as claude) gets the
+      # normal prefix so the two never collide on one session name.
       case "$safe" in
-        codex[1-4]|claude[1-4]|max[1-4]|"$provider"-*) printf '%s\n' "$safe" ;;
+        "$provider"[1-4]|"$provider"-*) printf '%s\n' "$safe" ;;
         *) printf '%s-%s\n' "$provider" "$safe" ;;
       esac
       ;;
@@ -108,14 +116,17 @@ _session_meta_dir(){ printf '%s/sessions\n' "$CONFIG_ROOT"; }
 _write_session_meta(){
   local session="$1" provider="$2" panes="$3" yolo="${4:-}" label
   label="$(_provider_label "$provider")"
-  mkdir -p "$(_session_meta_dir)" "$LEGACY_CONFIG_ROOT"
-  cat > "$(_session_meta_dir)/${session}.env" <<EOF
+  mkdir -p "$CONFIG_ROOT" "$(_session_meta_dir)"
+  chmod 0700 "$CONFIG_ROOT" "$(_session_meta_dir)" 2>/dev/null || true
+  ( umask 077; cat > "$(_session_meta_dir)/${session}.env" <<EOF
 MAXAGENT_PROVIDER=$provider
 MAXAGENT_PANES=$panes
 MAXAGENT_LABEL=$label
 MAXAGENT_YOLO=$yolo
 EOF
+  )
   if [ "$provider" = "claude" ] && [ "$SESSION_PREFIX" = "legacy" ]; then
+    mkdir -p "$LEGACY_CONFIG_ROOT"; chmod 0700 "$LEGACY_CONFIG_ROOT" 2>/dev/null || true
     printf '%s\n' "$panes" > "$LEGACY_CONFIG_ROOT/${session}.panes"
   fi
 }
@@ -135,6 +146,16 @@ _session_exists(){
 _session_known(){
   local session="$1"
   _session_exists "$session" || [ -r "$(_session_meta_dir)/${session}.env" ]
+}
+
+# Best-effort reverse of systemd-escape; falls back to the raw instance when
+# systemd-escape is absent (some minimal containers ship systemctl without it).
+_systemd_unescape(){
+  if command -v systemd-escape >/dev/null 2>&1; then
+    systemd-escape -u "$1" 2>/dev/null || printf '%s\n' "$1"
+  else
+    printf '%s\n' "$1"
+  fi
 }
 
 _unit_for(){
@@ -162,16 +183,17 @@ _legacy_unit_for(){
 }
 
 _sessions(){
-  "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null \
-    | sed -E 's/\x1b\[[0-9;]*m//g' \
+  # zellij exits 1 when there are no sessions; tolerate it under pipefail.
+  { "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } \
+    | sed $'s/\033\\[[0-9;]*m//g' \
     | { grep -vi 'EXITED' || true; } \
     | awk 'NF && !seen[$1]++{print $1}'
 }
 
 _prune(){
   local live u inst name
-  live="$("$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' | { grep -vi 'EXITED' || true; } | awk 'NF{print $1}')"
-  "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' | { grep -i 'EXITED' || true; } \
+  live="$({ "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } | sed $'s/\033\\[[0-9;]*m//g' | { grep -vi 'EXITED' || true; } | awk 'NF{print $1}')"
+  { "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } | sed $'s/\033\\[[0-9;]*m//g' | { grep -i 'EXITED' || true; } \
     | awk 'NF{print $1}' | while read -r name; do "$MAXAGENT_ZELLIJ" delete-session -f "$name" >/dev/null 2>&1; done
   for meta in "$(_session_meta_dir)"/*.env; do
     [ -e "$meta" ] || continue
@@ -182,9 +204,9 @@ _prune(){
   for u in $(systemctl --user list-units 'maxagent-named@*' 'maxclaude@*' 'maxclaude-named@*' --no-legend 2>/dev/null | awk '{print $1}'); do
     inst="${u%.service}"
     case "$u" in
-      maxagent-named@*) name="$(systemd-escape -u "${inst#maxagent-named@}")" ;;
+      maxagent-named@*) name="$(_systemd_unescape "${inst#maxagent-named@}")" ;;
       maxclaude@*) name="max${inst#maxclaude@}" ;;
-      maxclaude-named@*) name="$(systemd-escape -u "${inst#maxclaude-named@}")" ;;
+      maxclaude-named@*) name="$(_systemd_unescape "${inst#maxclaude-named@}")" ;;
       *) continue ;;
     esac
     grep -qxF "$name" <<<"$live" && continue
@@ -193,19 +215,36 @@ _prune(){
   done
 }
 
+# Resolve a user-typed target to an exact session name.
+#   - a pure number N  -> the Nth session from `ls`
+#   - an exact session name (live or with metadata) -> itself
+#   - a bare name (e.g. "work") -> the matching provider-qualified session,
+#     trying every provider namespace. Errors clearly on no match or ambiguity
+#     instead of silently fabricating a name in the default provider's namespace.
 _resolve_list_index(){
-  local tgt="$1" nm candidate
+  local tgt="$1" nm safe c matches=()
   case "$tgt" in
     ''|*[!0-9]*)
       if _session_known "$tgt"; then
         printf '%s\n' "$tgt"
         return
       fi
-      candidate="$(_session_for "$DEFAULT_PROVIDER" "$tgt" 2>/dev/null || true)"
-      if [ -n "$candidate" ]; then
-        printf '%s\n' "$candidate"
+      safe="$(_sanitize "$tgt" 2>/dev/null || true)"
+      if [ -n "$safe" ]; then
+        for c in "codex-$safe" "claude-$safe" "$safe" "max$safe"; do
+          _session_known "$c" || continue
+          case " ${matches[*]-} " in *" $c "*) ;; *) matches+=("$c") ;; esac
+        done
+      fi
+      if [ "${#matches[@]}" -eq 1 ]; then
+        printf '%s\n' "${matches[0]}"
+      elif [ "${#matches[@]}" -gt 1 ]; then
+        echo "Ambiguous session '$tgt' (matches: ${matches[*]}). Use the full name." >&2
+        return 2
       else
-        printf '%s\n' "$tgt"
+        echo "No session matching '$tgt'." >&2
+        _list >&2
+        return 2
       fi
       ;;
     *)
@@ -218,7 +257,6 @@ _resolve_list_index(){
 
 _close(){
   local sess="$1"
-  case "$sess" in [1-4]) sess="$(_session_for "$DEFAULT_PROVIDER" "$sess")" ;; esac
   if _has_systemd; then
     systemctl --user disable --now "$(_unit_for "$sess")" >/dev/null 2>&1 || true
     systemctl --user disable --now "$(_legacy_unit_for "$sess")" >/dev/null 2>&1 || true
@@ -241,20 +279,32 @@ _open(){
   session="$(_session_for "$provider" "$sel")" || { echo "invalid session name: $sel" >&2; return 2; }
   case "$sel" in 1|2|3|4) panes="$sel" ;; esac
   layout="agent${panes}"
+  local meta_file prov_arg yolo_arg current_yolo
+  meta_file="$(_session_meta_dir)/${session}.env"
   if _session_exists "$session"; then
-    local current_yolo
-    current_yolo="$(_meta_value "$session" MAXAGENT_YOLO 2>/dev/null || echo '')"
-    if [ "$current_yolo" != "$yolo" ]; then
-      echo "$APP: session '$session' already exists with different yolo mode." >&2
-      echo "Close it first, then reopen: $APP close $session && $APP ${sel} $([ -n "$yolo" ] && printf '%s' '--yolo')" >&2
-      return 2
+    # Re-attach to a live session. Only enforce the yolo check when we have
+    # recorded metadata (a pre-upgrade session has none; don't false-alarm).
+    # Never rewrite metadata here, so a bare re-attach can't clobber the
+    # session's original pane count.
+    if [ -r "$meta_file" ]; then
+      current_yolo="$(_meta_value "$session" MAXAGENT_YOLO 2>/dev/null || echo '')"
+      if [ "$current_yolo" != "$yolo" ]; then
+        case "$APP" in maxcodex|maxclaude) prov_arg="" ;; *) prov_arg="$provider " ;; esac
+        if [ -n "$yolo" ]; then yolo_arg=" --yolo"; else yolo_arg=""; fi
+        echo "$APP: session '$session' already exists with different yolo mode." >&2
+        echo "Close it first, then reopen: $APP close $session && $APP ${prov_arg}${sel}${yolo_arg}" >&2
+        return 2
+      fi
+    else
+      _write_session_meta "$session" "$provider" "$panes" "$yolo"
     fi
+  else
+    _write_session_meta "$session" "$provider" "$panes" "$yolo"
   fi
-  _write_session_meta "$session" "$provider" "$panes" "$yolo"
   if _has_systemd; then
     loginctl enable-linger "$USER" >/dev/null 2>&1 || true
     systemctl --user start "$(_unit_for "$session")" >/dev/null 2>&1 \
-      || { echo "Failed to start $(_unit_for "$session"):" >&2; systemctl --user status "$(_unit_for "$session")" --no-pager | head; return 1; }
+      || { echo "Failed to start $(_unit_for "$session"):" >&2; systemctl --user status "$(_unit_for "$session")" --no-pager | head -n 10; return 1; }
     "$MAXAGENT_ZELLIJ" attach "$session"
   else
     exec "$MAXAGENT_ZELLIJ" --layout "$layout" attach -c "$session"
@@ -265,8 +315,8 @@ _list(){
   local names i=0 nm provider panes yolo tags label
   _prune
   names="$(_sessions)"
-  if [ -z "$names" ]; then echo "No maxagent sessions."; return; fi
-  echo "maxagent sessions:"
+  if [ -z "$names" ]; then echo "No ${APP} sessions."; return; fi
+  echo "${APP} sessions:"
   while IFS= read -r nm; do
     if [ -z "$nm" ]; then
       continue
@@ -303,7 +353,7 @@ _kill_all(){
 }
 
 _main(){
-  local provider="$DEFAULT_PROVIDER" sel="${1:-}" tgt yolo="" args=()
+  local provider="$DEFAULT_PROVIDER" sel="${1:-}" tgt tgt_panes yolo="" args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --yolo|--dangerous|--skip-permissions) yolo=1 ;;
@@ -312,7 +362,7 @@ _main(){
     esac
     shift
   done
-  set -- "${args[@]}"
+  set -- ${args[@]+"${args[@]}"}
   sel="${1:-}"
   case "$sel" in
     -h|--help|help) _usage; return ;;
@@ -334,6 +384,19 @@ _main(){
       tgt="${2:-}"
       [ -n "$tgt" ] || { echo "usage: $APP attach <number|name>" >&2; _list; return 2; }
       tgt="$(_resolve_list_index "$tgt")" || return $?
+      if ! _session_exists "$tgt" && [ -r "$(_session_meta_dir)/${tgt}.env" ]; then
+        # Known but not live: recreate then attach (create-or-attach), matching
+        # the old maxclaude behavior instead of erroring on a dead session.
+        if _has_systemd; then
+          loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+          systemctl --user start "$(_unit_for "$tgt")" >/dev/null 2>&1 \
+            || { echo "Failed to start $(_unit_for "$tgt"):" >&2; systemctl --user status "$(_unit_for "$tgt")" --no-pager | head -n 10; return 1; }
+        else
+          tgt_panes="$(_meta_value "$tgt" MAXAGENT_PANES 2>/dev/null || echo 4)"
+          case "$tgt_panes" in 1|2|3|4) ;; *) tgt_panes=4 ;; esac
+          exec "$MAXAGENT_ZELLIJ" --layout "agent${tgt_panes}" attach -c "$tgt"
+        fi
+      fi
       "$MAXAGENT_ZELLIJ" attach "$tgt"
       return ;;
   esac

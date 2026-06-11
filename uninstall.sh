@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # maxagent uninstaller. Stops running sessions and removes files the installer
 # created. Leaves zellij itself in place unless --remove-zellij is passed.
+#
+# Options:
+#   --remove-zellij            also delete ~/.local/bin/zellij
+#   --keep-legacy-maxclaude    keep the maxclaude command and ~/.config/maxclaude
+#   -h, --help                 show this help
 set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
@@ -14,7 +19,7 @@ for a in "$@"; do
   case "$a" in
     --remove-zellij) REMOVE_ZELLIJ=1 ;;
     --keep-legacy-maxclaude) KEEP_LEGACY=1 ;;
-    -h|--help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
   esac
 done
 
