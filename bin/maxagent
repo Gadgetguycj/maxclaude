@@ -268,8 +268,7 @@ _close(){
 }
 
 _open(){
-  local provider="$1" sel="$2" panes="${3:-4}" yolo="${4:-}" session layout
-  case "$panes" in 1|2|3|4) ;; *) panes=4 ;; esac
+  local provider="$1" sel="$2" panes="${3:-}" yolo="${4:-}" session layout
   [ -n "${ZELLIJ:-}" ] && {
     echo "Already inside a zellij session (${ZELLIJ_SESSION_NAME:-?})." >&2
     echo "Detach with Ctrl-o d, then run $APP from a plain shell to (re)attach." >&2
@@ -278,9 +277,15 @@ _open(){
   case "$sel" in max[1-4]) [ "$provider" = "claude" ] && sel="${sel#max}" ;; esac
   session="$(_session_for "$provider" "$sel")" || { echo "invalid session name: $sel" >&2; return 2; }
   case "$sel" in 1|2|3|4) panes="$sel" ;; esac
-  layout="agent${panes}"
   local meta_file prov_arg yolo_arg current_yolo
   meta_file="$(_session_meta_dir)/${session}.env"
+  # No explicit pane count: reuse the recorded count so reopening a session
+  # can't clobber its shape; default to 4 only when there is no metadata.
+  if [ -z "$panes" ] && [ -r "$meta_file" ]; then
+    panes="$(_meta_value "$session" MAXAGENT_PANES 2>/dev/null || echo '')"
+  fi
+  case "$panes" in 1|2|3|4) ;; *) panes=4 ;; esac
+  layout="agent${panes}"
   if _session_exists "$session"; then
     # Re-attach to a live session. Only enforce the yolo check when we have
     # recorded metadata (a pre-upgrade session has none; don't false-alarm).
@@ -408,7 +413,7 @@ _main(){
   else
     sel="${sel:-4}"
   fi
-  _open "$provider" "$sel" "${2:-4}" "$yolo"
+  _open "$provider" "$sel" "${2:-}" "$yolo"
 }
 
 _main "$@"
