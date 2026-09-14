@@ -360,7 +360,8 @@ esac
 
 step "Done"
 say "Start a Codex session:"
-say "  ${c_bold}maxcodex${c_off}        # 2x2 grid of 4 Codex panes"
+say "  ${c_bold}maxcodex${c_off}        # one Codex pane"
+say "  ${c_bold}maxcodex 4${c_off}      # 2x2 grid of 4 Codex panes"
 say "  ${c_bold}maxcodex 2${c_off}      # two Codex panes"
 say "  ${c_bold}maxcodex work${c_off}   # named Codex workspace"
 say ""

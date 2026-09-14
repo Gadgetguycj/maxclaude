@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # maxagent — persistent coding-agent session(s) in a zellij multiplexer.
 #
-#   maxagent [codex|claude]          2x2 grid of 4 panes
+#   maxagent [codex|claude]          single pane (same as 1)
 #   maxagent [codex|claude] 1|2|3|4  numbered N-pane session
-#   maxagent [codex|claude] <name>   named workspace, 4 panes
+#   maxagent [codex|claude] <name>   named workspace, 1 pane
 #   maxagent [codex|claude] <name> N named workspace with N panes
 #   maxagent ls                      list live sessions
 #   maxagent attach <number|name>    attach a listed session or named session
@@ -58,6 +58,8 @@ Usage:
   $APP attach <number|name>
   $APP close <number|name|all>
   $APP prune
+
+With no pane count, $APP opens a single pane. Pass 2, 3 or 4 for more.
 
 Note: 'codex' and 'claude' are provider selectors, so they cannot be used as
 workspace names. Pick another name (e.g. '$APP codex work').
@@ -280,11 +282,11 @@ _open(){
   local meta_file prov_arg yolo_arg current_yolo
   meta_file="$(_session_meta_dir)/${session}.env"
   # No explicit pane count: reuse the recorded count so reopening a session
-  # can't clobber its shape; default to 4 only when there is no metadata.
+  # can't clobber its shape; default to 1 only when there is no metadata.
   if [ -z "$panes" ] && [ -r "$meta_file" ]; then
     panes="$(_meta_value "$session" MAXAGENT_PANES 2>/dev/null || echo '')"
   fi
-  case "$panes" in 1|2|3|4) ;; *) panes=4 ;; esac
+  case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
   layout="agent${panes}"
   if _session_exists "$session"; then
     # Re-attach to a live session. Only enforce the yolo check when we have
@@ -397,8 +399,8 @@ _main(){
           systemctl --user start "$(_unit_for "$tgt")" >/dev/null 2>&1 \
             || { echo "Failed to start $(_unit_for "$tgt"):" >&2; systemctl --user status "$(_unit_for "$tgt")" --no-pager | head -n 10; return 1; }
         else
-          tgt_panes="$(_meta_value "$tgt" MAXAGENT_PANES 2>/dev/null || echo 4)"
-          case "$tgt_panes" in 1|2|3|4) ;; *) tgt_panes=4 ;; esac
+          tgt_panes="$(_meta_value "$tgt" MAXAGENT_PANES 2>/dev/null || echo 1)"
+          case "$tgt_panes" in 1|2|3|4) ;; *) tgt_panes=1 ;; esac
           exec "$MAXAGENT_ZELLIJ" --layout "agent${tgt_panes}" attach -c "$tgt"
         fi
       fi
@@ -409,9 +411,9 @@ _main(){
   if [ -n "$sel" ] && _is_provider "$sel"; then
     provider="$sel"
     shift
-    sel="${1:-4}"
+    sel="${1:-1}"
   else
-    sel="${sel:-4}"
+    sel="${sel:-1}"
   fi
   _open "$provider" "$sel" "${2:-}" "$yolo"
 }

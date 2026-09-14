@@ -5,7 +5,8 @@ sessions. This is useful on a Linux dev server: start multiple agent panes,
 detach, close SSH, reconnect later, and attach to the same running workspace.
 
 ```bash
-maxcodex          # 2x2 grid of 4 Codex panes
+maxcodex          # one Codex pane
+maxcodex 4        # 2x2 grid of 4 Codex panes
 maxcodex 2        # two Codex panes
 maxcodex work     # named Codex workspace
 maxclaude         # Claude compatibility command
@@ -17,7 +18,7 @@ maxclaude         # Claude compatibility command
 ├───────────────┼───────────────┤
 │   agent #3    │   agent #4    │
 └───────────────┴───────────────┘
-        maxagent
+       maxagent 4
 ```
 
 ## Install
@@ -115,8 +116,8 @@ maxagent 4 --yolo
 Start Codex:
 
 ```bash
-maxcodex          # 4 panes
-maxcodex 1        # 1 pane
+maxcodex          # 1 pane (the default)
+maxcodex 4        # 2x2 grid of 4 panes
 maxcodex 2        # 2 panes
 maxcodex work     # named workspace
 maxcodex oss 2    # named workspace with 2 panes
