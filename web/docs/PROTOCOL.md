@@ -24,6 +24,24 @@ The agent also sends `event` messages for availability and status changes. The h
 
 Supported control methods include agent information, session listing, creation, rename, deletion, transcript listing, path checks, file transfer setup, and HTTP or WebSocket proxy setup. Inputs are validated at the agent before local actions occur.
 
+## Session activity
+
+A `sessions.list` result includes `activity`, `activityUpdatedAt`, `lastResponseAt`, and `lastActivityAt` for each session. Activity can be `busy`, `background`, `idle`, `absent`, or `unknown`.
+
+`lastResponseAt` records the latest Stop hook. A unique current transcript can supply the latest assistant timestamp when no Stop record exists. A transcript associated with multiple live sessions supplies no timestamps to those sessions.
+
+`lastActivityAt` records the latest per-session hook event or the latest user or assistant timestamp from a unique current transcript. Background work can advance it with a real task start, output modification, or matching Stop snapshot. The hub and browser sort this timestamp in descending order and use the session name to break ties.
+
+The agent sends `sessions.status` events with the same activity fields. The hub keeps the latest event snapshot. A live browser applies that snapshot immediately, so its Recent order matches the order produced after a reload.
+
+## Activity hook records
+
+The generic hook installer adds `UserPromptSubmit`, `PreToolUse`, and `PostToolUse` hooks that report busy state. It adds `Stop` and `Notification` hooks that report idle state. The Stop hook also stores response time and the reported background task count. Installation preserves existing settings and hook groups.
+
+The agent validates every hook record against a live Claude Code process in the same zellij session and pane. A background record alone cannot establish background state. Background state requires a live shell task wrapper descended from the current Claude Code process, with matching session, pane, and Claude Code session identifiers. Process exit clears the state at the next scan.
+
+The status helper writes atomic per-pane status, response, and background records below `MCW_STATUS_DIR`. The helper always exits successfully so activity reporting cannot interrupt a Claude Code turn.
+
 ## Binary framing
 
 Each binary frame starts with a six-byte header.

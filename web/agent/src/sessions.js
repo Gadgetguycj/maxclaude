@@ -82,6 +82,7 @@ export async function listSessions() {
     session.activity = activity[session.name]?.state || 'absent';
     session.activityUpdatedAt = activity[session.name]?.updatedAt || 0;
     session.lastResponseAt = activity[session.name]?.lastResponseAt || 0;
+    session.lastActivityAt = activity[session.name]?.lastActivityAt || 0;
   }
   return { sessions };
 }

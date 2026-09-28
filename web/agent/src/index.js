@@ -54,10 +54,13 @@ async function main() {
         state: session.activity,
         updatedAt: session.activityUpdatedAt,
         lastResponseAt: session.lastResponseAt,
+        lastActivityAt: session.lastActivityAt,
       }]));
       const changed = [...current].some(([name, status]) => (
         priorStatus.get(name)?.state !== status.state
+        || priorStatus.get(name)?.updatedAt !== status.updatedAt
         || priorStatus.get(name)?.lastResponseAt !== status.lastResponseAt
+        || priorStatus.get(name)?.lastActivityAt !== status.lastActivityAt
       ))
         || [...priorStatus].some(([name]) => !current.has(name));
       if (changed || priorConnectionEpoch !== tunnel.connectionEpoch) {

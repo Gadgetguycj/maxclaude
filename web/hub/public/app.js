@@ -167,7 +167,7 @@ const S = {
 const UNFILED_KEY = '__unfiled__';
 const RECENTS_KEY = '__recents__';
 const FOLDERS_KEY = '__folders__';
-const STATE_TEXT = { busy: 'working', idle: 'waiting for input', absent: 'no Claude process', running: 'running', exited: 'exited', missing: 'not created', unknown: 'unknown' };
+const STATE_TEXT = { busy: 'working', background: 'working in background', idle: 'waiting for input', absent: 'no Claude process', running: 'running', exited: 'exited', missing: 'not created', unknown: 'unknown' };
 let eventSource = null;
 
 function startEvents() {
@@ -177,7 +177,6 @@ function startEvents() {
     try {
       const payload = JSON.parse(ev.data);
       S.sessionStatus = payload.session_status || payload || {};
-      S.sig = '';
       render();
     } catch (e) { /* malformed server event is ignored */ }
   };
@@ -242,7 +241,7 @@ function liveState(sessionName) {
     if (s.name !== sessionName) continue;
     if (s.exited) return 'exited';
     const activity = S.sessionStatus[sessionName]?.state || s.activity;
-    if (activity === 'busy' || activity === 'idle' || activity === 'absent' || activity === 'unknown') return activity;
+    if (activity === 'busy' || activity === 'background' || activity === 'idle' || activity === 'absent' || activity === 'unknown') return activity;
     return 'unknown';
   }
   return 'missing';
@@ -432,7 +431,18 @@ document.body.classList.toggle('document-hidden', document.hidden);
 /* ---------- render ---------- */
 
 function stateSig() {
-  return JSON.stringify([S.agent.connected === true, S.stateError, S.nodes, S.sessions, S.sessionStatus, S.recents, S.recentLimit, S.active]);
+  const sessions = Array.isArray(S.sessions) ? S.sessions.map(function (session) {
+    return [session.name, session.exited, session.originalCreatedAt, session.createdAt];
+  }) : S.sessions;
+  return JSON.stringify([
+    S.agent.connected === true,
+    S.stateError,
+    S.nodes,
+    sessions,
+    Array.isArray(S.sessions) ? null : S.recents,
+    S.recentLimit,
+    S.active
+  ]);
 }
 
 function render() {
@@ -443,6 +453,7 @@ function render() {
     S.sig = sig;
     renderTree();
   }
+  syncActivityViews();
   syncFrames();
 }
 
@@ -565,25 +576,120 @@ function recentPath(name) {
 }
 
 function recentRows() {
-  if (!Array.isArray(S.sessions)) return S.recents.slice(0, S.recentLimit);
+  if (!Array.isArray(S.sessions)) return S.recents.slice(0, S.recentLimit).map(function (recent) {
+    return {
+      session_name: recent.session_name,
+      last_activity_at: Number(recent.last_activity_at || recent.last_response_at) || 0,
+      state: 'idle'
+    };
+  });
   return S.sessions
     .filter(function (session) { return session && session.name && !session.exited; })
     .map(function (session) {
+      const status = S.sessionStatus[session.name] || {};
+      const statusActivity = Object.prototype.hasOwnProperty.call(status, 'lastActivityAt')
+        ? Number(status.lastActivityAt) || 0
+        : (Number(status.updatedAt) || Number(status.lastResponseAt) || 0);
+      const sessionActivity = Object.prototype.hasOwnProperty.call(session, 'lastActivityAt')
+        ? Number(session.lastActivityAt) || 0
+        : (Number(session.activityUpdatedAt) || Number(session.lastResponseAt) || 0);
+      const lastActivityAt = Object.prototype.hasOwnProperty.call(S.sessionStatus, session.name)
+        ? Math.max(0, statusActivity)
+        : Math.max(0, sessionActivity);
       return {
         session_name: session.name,
-        last_response_at: Math.max(
-          0,
-          Number(S.sessionStatus[session.name]?.lastResponseAt) || 0,
-          Number(session.lastResponseAt) || 0
-        )
+        last_activity_at: lastActivityAt,
+        state: liveState(session.name)
       };
     })
     .sort(function (left, right) {
-      return right.last_response_at - left.last_response_at
+      return right.last_activity_at - left.last_activity_at
         || left.session_name.localeCompare(right.session_name);
     })
     .slice(0, S.recentLimit);
 }
+
+function recentRow(recent) {
+  const row = h('div', {
+    class: 'row recent', role: 'treeitem', tabindex: '0',
+    dataset: { kind: 'recent', name: recent.session_name }
+  }, statusSlot('unknown'),
+    h('span', { class: 'name' }),
+    h('span', { class: 'age' }),
+    h('button', { class: 'act', type: 'button', dataset: { act: 'menu' } }, '…'));
+  setDepth(row, 0);
+  updateRecentRow(row, recent);
+  return row;
+}
+
+function updateStatusRow(row, state, label) {
+  row.classList.toggle('selected', S.active === row.dataset.name);
+  row.setAttribute('aria-label', label);
+  const dot = row.querySelector('.slot .dot');
+  if (dot) {
+    dot.className = 'dot st-' + state;
+    dot.title = STATE_TEXT[state] || state;
+  }
+}
+
+function updateRecentRow(row, recent) {
+  const name = recent.session_name;
+  const state = liveState(name);
+  row.dataset.name = name;
+  row.dataset.activityAt = String(recent.last_activity_at || 0);
+  row.dataset.state = recent.state || state;
+  updateStatusRow(row, state, name + ', ' + (STATE_TEXT[state] || state) + ', recent');
+  const nameEl = row.querySelector('.name');
+  nameEl.textContent = name;
+  nameEl.title = name;
+  const age = row.querySelector('.age');
+  age.textContent = fmtShortAge(recent.last_activity_at);
+  age.title = recentPath(name) + (recent.last_activity_at ? ' · ' + new Date(recent.last_activity_at).toLocaleString() : '');
+  const action = row.querySelector('button.act');
+  action.setAttribute('aria-label', 'Actions for ' + name);
+}
+
+function syncRecentRows() {
+  const tree = $('#tree');
+  const section = tree.querySelector('.row.section[data-id="' + RECENTS_KEY + '"]');
+  if (!section) return;
+  const desired = section.getAttribute('aria-expanded') === 'true' ? recentRows() : [];
+  const existing = new Map(Array.from(tree.querySelectorAll('.row[data-kind="recent"]')).map(function (row) {
+    return [row.dataset.name, row];
+  }));
+  const focused = document.activeElement;
+  let cursor = section.nextSibling;
+  for (const recent of desired) {
+    let row = existing.get(recent.session_name);
+    if (row) existing.delete(recent.session_name);
+    else row = recentRow(recent);
+    updateRecentRow(row, recent);
+    if (row !== cursor) tree.insertBefore(row, cursor);
+    cursor = row.nextSibling;
+  }
+  for (const row of existing.values()) row.remove();
+  if (focused && focused.isConnected && document.activeElement !== focused) {
+    try { focused.focus({ preventScroll: true }); } catch (e) { focused.focus(); }
+  }
+}
+
+function syncActivityViews() {
+  if (!S.authed) return;
+  syncRecentRows();
+  for (const row of document.querySelectorAll('#tree .row[data-name]:not([data-kind="recent"])')) {
+    const name = row.dataset.name;
+    const state = liveState(name);
+    const labelName = row.querySelector('.name')?.textContent || name;
+    const suffix = row.dataset.kind === 'unfiled' ? ', unfiled' : '';
+    updateStatusRow(row, state, labelName + ', ' + (STATE_TEXT[state] || state) + suffix);
+    const age = row.querySelector('.age');
+    if (age) age.textContent = sessionAge(name, 0);
+  }
+}
+
+setInterval(function () {
+  if (!document.hidden) syncActivityViews();
+}, 1000);
 
 function addGuides(row, depth, continuations, last, ownStem) {
   const g = geometry();
@@ -747,22 +853,7 @@ function renderRecents() {
   });
   const controls = h('span', { class: 'recent-controls' }, h('span', null, 'Show'), select);
   frag.append(sectionRow(RECENTS_KEY, 'Recent', open, controls));
-  if (open) for (const recent of recentRows()) {
-    const st = liveState(recent.session_name);
-    const row = h('div', {
-      class: 'row recent' + (S.active === recent.session_name ? ' selected' : ''), role: 'treeitem', tabindex: '0',
-      'aria-label': recent.session_name + ', ' + (STATE_TEXT[st] || st) + ', recent',
-      dataset: { kind: 'recent', name: recent.session_name }
-    }, statusSlot(st),
-      h('span', { class: 'name', title: recent.session_name }, recent.session_name),
-      h('span', {
-        class: 'age',
-        title: recentPath(recent.session_name) + (recent.last_response_at ? ' · ' + new Date(recent.last_response_at).toLocaleString() : '')
-      }, fmtShortAge(recent.last_response_at)),
-      h('button', { class: 'act', type: 'button', 'aria-label': 'Actions for ' + recent.session_name, dataset: { act: 'menu' } }, '…'));
-    setDepth(row, 0);
-    frag.append(row);
-  }
+  if (open) for (const recent of recentRows()) frag.append(recentRow(recent));
   return frag;
 }
 

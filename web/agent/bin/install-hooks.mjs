@@ -20,6 +20,7 @@ function add(event, args) {
 }
 add('UserPromptSubmit', ['busy']);
 add('PreToolUse', ['busy']);
+add('PostToolUse', ['busy']);
 add('Stop', ['idle', 'stop']);
 add('Notification', ['idle']);
 fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 });

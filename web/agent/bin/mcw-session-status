@@ -45,5 +45,16 @@ if [ "$event" = "stop" ]; then
     printf '{"lastResponseAt":%s}\n' "$milliseconds" > "$response_tmp" 2>/dev/null || true
   fi
   if [ -s "$response_tmp" ]; then mv -f "$response_tmp" "$base/$pane.response.json" 2>/dev/null || true; else rm -f "$response_tmp" 2>/dev/null || true; fi
+
+  background_tmp="$base/.${pane}.background.$$.tmp"
+  if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then
+    printf '%s' "$payload" | jq -c --argjson updatedAt "$milliseconds" --arg transcriptPath "$transcript" '
+      {updatedAt:$updatedAt,taskCount:([.background_tasks[]?] | length)}
+      + (if $transcriptPath == "" then {} else {transcriptPath:$transcriptPath} end)
+    ' > "$background_tmp" 2>/dev/null || true
+  else
+    printf '{"updatedAt":%s,"taskCount":0}\n' "$milliseconds" > "$background_tmp" 2>/dev/null || true
+  fi
+  if [ -s "$background_tmp" ]; then mv -f "$background_tmp" "$base/$pane.background.json" 2>/dev/null || true; else rm -f "$background_tmp" 2>/dev/null || true; fi
 fi
 exit 0

@@ -4,7 +4,7 @@ The agent runs on the machine that hosts Claude Code and zellij. It makes an out
 
 Set `MCW_HUB_URL` and `MCW_AGENT_SECRET`, then run `./install.sh`. The installer writes the secret with restrictive permissions and never prints it.
 
-Run `./install.sh --install-hooks` to merge status hooks into Claude Code settings. The hook installer retains existing settings and existing hooks.
+Run `./install.sh --install-hooks` to merge status hooks into Claude Code settings. The hook installer retains existing settings and existing hooks. It reports prompt submission, activity before and after tools, completion, and notifications.
 
 The defaults use the current user's home and configuration directories. The installer records runtime settings in `agent.env`, installs a user service, and supports these variables.
 

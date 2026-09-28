@@ -429,7 +429,7 @@ async function main() {
     const listed = sl.sessions.find((s) => s.name === name);
     check('sessions.list reports a real creation timestamp and live activity',
       Number.isInteger(listed?.createdAt) && listed.createdAt > 0
-        && ['busy', 'idle', 'absent', 'unknown'].includes(listed.activity)
+        && ['busy', 'background', 'idle', 'absent', 'unknown'].includes(listed.activity)
         && Number.isInteger(listed.activityUpdatedAt),
       JSON.stringify(listed));
 

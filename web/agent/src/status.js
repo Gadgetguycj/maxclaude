@@ -26,10 +26,26 @@ function isClaudeCommand(values) {
   return !/(?:^|\s)(?:bg-pty-host|bg-spare)(?:\s|$)|daemon run|--fork-session/.test(args);
 }
 
-export function readLiveClaudePanes(procRoot = '/proc') {
-  const panes = new Map();
+function descendsFrom(pid, ancestors, procRoot) {
+  let current = Number(pid);
+  for (let depth = 0; current > 1 && depth < 64; depth += 1) {
+    let parent = 0;
+    try {
+      const match = fs.readFileSync(path.join(procRoot, String(current), 'status'), 'utf8').match(/^PPid:\s+(\d+)/m);
+      parent = Number(match?.[1] || 0);
+    } catch { return false; }
+    if (ancestors.has(parent)) return true;
+    current = parent;
+  }
+  return false;
+}
+
+function readProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackgroundAgeMs = 2000) {
+  const claudePanes = new Map();
+  const backgroundRoots = new Map();
+  const backgroundOutput = new Map();
   let entries = [];
-  try { entries = fs.readdirSync(procRoot, { withFileTypes: true }); } catch { return panes; }
+  try { entries = fs.readdirSync(procRoot, { withFileTypes: true }); } catch { return { claudePanes, backgroundPanes: new Map() }; }
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
     const proc = path.join(procRoot, entry.name);
@@ -37,24 +53,72 @@ export function readLiveClaudePanes(procRoot = '/proc') {
     const session = envValue(env, 'ZELLIJ_SESSION_NAME');
     const pane = envValue(env, 'ZELLIJ_PANE_ID') || `pid-${entry.name}`;
     const command = readNulFile(path.join(proc, 'cmdline'));
-    if (!session || !isClaudeCommand(command)) continue;
+    if (!session || !command[0]) continue;
     let startedAt = 0;
     try { startedAt = Math.floor(fs.statSync(proc).ctimeMs); } catch { /* process exited while sampled */ }
     const key = `${session}\0${pane}`;
-    const previous = panes.get(key);
-    const started = previous?.startedAt && startedAt
-      ? Math.min(previous.startedAt, startedAt)
-      : (previous?.startedAt || startedAt);
-    panes.set(key, {
+    if (isClaudeCommand(command)) {
+      const previous = claudePanes.get(key);
+      const started = previous?.startedAt && startedAt
+        ? Math.min(previous.startedAt, startedAt)
+        : (previous?.startedAt || startedAt);
+      claudePanes.set(key, {
+        session,
+        pane,
+        startedAt: started,
+        pids: [...(previous?.pids || []), Number(entry.name)],
+        commands: [...(previous?.commands || []), command],
+        cwd: previous?.cwd || (() => { try { return fs.readlinkSync(path.join(proc, 'cwd')); } catch { return null; } })(),
+      });
+      continue;
+    }
+    const sessionId = envValue(env, 'CLAUDE_CODE_SESSION_ID');
+    if (!envValue(env, 'ZELLIJ_PANE_ID') || !sessionId) continue;
+    const backgroundKey = `${key}\0${sessionId}`;
+    for (const fd of ['1', '2']) {
+      try {
+        const stat = fs.statSync(path.join(proc, 'fd', fd));
+        if (stat.isFile()) backgroundOutput.set(backgroundKey, Math.max(backgroundOutput.get(backgroundKey) || 0, Math.floor(stat.mtimeMs)));
+      } catch { /* process exited or output is not statable */ }
+    }
+    const executable = path.basename(command[0]);
+    const commandLine = command.join(' ');
+    if (!/^(?:ba|z)?sh$/.test(executable) || !commandLine.includes('/.claude/shell-snapshots/')) continue;
+    if (now - startedAt < minBackgroundAgeMs) continue;
+    const previous = backgroundRoots.get(backgroundKey);
+    backgroundRoots.set(backgroundKey, {
       session,
       pane,
-      startedAt: started,
+      startedAt: Math.min(previous?.startedAt || startedAt, startedAt),
       pids: [...(previous?.pids || []), Number(entry.name)],
-      commands: [...(previous?.commands || []), command],
-      cwd: previous?.cwd || (() => { try { return fs.readlinkSync(path.join(proc, 'cwd')); } catch { return null; } })(),
+      sessionId,
     });
   }
-  return panes;
+  const backgroundPanes = new Map();
+  for (const [backgroundKey, root] of backgroundRoots) {
+    const key = `${root.session}\0${root.pane}`;
+    const mainPids = new Set(claudePanes.get(key)?.pids || []);
+    if (!mainPids.size || !root.pids.some((pid) => descendsFrom(pid, mainPids, procRoot))) continue;
+    const previous = backgroundPanes.get(key);
+    const activityAt = Math.max(root.startedAt, backgroundOutput.get(backgroundKey) || 0);
+    backgroundPanes.set(key, {
+      session: root.session,
+      pane: root.pane,
+      startedAt: Math.min(previous?.startedAt || root.startedAt, root.startedAt),
+      activityAt: Math.max(previous?.activityAt || 0, activityAt),
+      pids: [...(previous?.pids || []), ...root.pids],
+      sessionIds: [...new Set([...(previous?.sessionIds || []), root.sessionId])],
+    });
+  }
+  return { claudePanes, backgroundPanes };
+}
+
+export function readLiveClaudePanes(procRoot = '/proc') {
+  return readProcessSnapshot(procRoot).claudePanes;
+}
+
+export function readLiveBackgroundPanes(procRoot = '/proc', now = Date.now(), minAgeMs = 2000) {
+  return readProcessSnapshot(procRoot, now, minAgeMs).backgroundPanes;
 }
 
 function readPaneStatus(session, pane, statusDir) {
@@ -81,6 +145,21 @@ function readResponseStatus(session, pane, statusDir) {
     if (!Number.isFinite(value.lastResponseAt) || value.lastResponseAt <= 0) return null;
     return {
       lastResponseAt: Math.floor(value.lastResponseAt),
+      transcriptPath: typeof value.transcriptPath === 'string' ? value.transcriptPath : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readBackgroundStatus(session, pane, statusDir) {
+  const file = path.join(statusDir, session, `${pane}.background.json`);
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!Number.isFinite(value.updatedAt) || !Number.isInteger(value.taskCount) || value.taskCount < 0) return null;
+    return {
+      updatedAt: Math.floor(value.updatedAt),
+      taskCount: value.taskCount,
       transcriptPath: typeof value.transcriptPath === 'string' ? value.transcriptPath : null,
     };
   } catch {
@@ -142,20 +221,21 @@ function transcriptForPane(pane, status, options, envIds) {
   return fs.existsSync(file) ? file : null;
 }
 
-function assistantTimestamp(file) {
+function transcriptTimestamps(file) {
   let stat;
-  try { stat = fs.statSync(file); } catch { return 0; }
+  try { stat = fs.statSync(file); } catch { return { assistantAt: 0, activityAt: 0 }; }
   const cached = transcriptCache.get(file);
-  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.at;
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached;
 
-  let at = 0;
+  let assistantAt = 0;
+  let activityAt = 0;
   let fd;
   try {
     fd = fs.openSync(file, 'r');
     let position = stat.size;
     let carry = '';
     const chunkSize = 64 * 1024;
-    while (position > 0 && !at) {
+    while (position > 0 && (!assistantAt || !activityAt)) {
       const size = Math.min(chunkSize, position);
       position -= size;
       const buffer = Buffer.allocUnsafe(size);
@@ -164,50 +244,63 @@ function assistantTimestamp(file) {
       carry = parts.shift() || '';
       for (let index = parts.length - 1; index >= 0; index -= 1) {
         const line = parts[index];
-        if (!line.includes('"type":"assistant"') && !line.includes('"type": "assistant"')) continue;
+        if (!line.includes('"type":"assistant"') && !line.includes('"type": "assistant"')
+          && !line.includes('"type":"user"') && !line.includes('"type": "user"')) continue;
         try {
           const record = JSON.parse(line);
-          if (record.type !== 'assistant') continue;
+          if (record.type !== 'assistant' && record.type !== 'user') continue;
           const parsed = Date.parse(record.timestamp);
-          if (Number.isFinite(parsed) && parsed > 0) { at = parsed; break; }
+          if (!Number.isFinite(parsed) || parsed <= 0) continue;
+          if (!activityAt) activityAt = parsed;
+          if (!assistantAt && record.type === 'assistant') assistantAt = parsed;
+          if (assistantAt && activityAt) break;
         } catch { /* an incomplete line is ignored */ }
       }
     }
-    if (!at && carry) {
+    if ((!assistantAt || !activityAt) && carry) {
       try {
         const record = JSON.parse(carry);
-        const parsed = record.type === 'assistant' ? Date.parse(record.timestamp) : 0;
-        if (Number.isFinite(parsed) && parsed > 0) at = parsed;
+        if (record.type === 'assistant' || record.type === 'user') {
+          const parsed = Date.parse(record.timestamp);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            if (!activityAt) activityAt = parsed;
+            if (!assistantAt && record.type === 'assistant') assistantAt = parsed;
+          }
+        }
       } catch { /* no complete assistant entry */ }
     }
   } catch {
-    at = 0;
+    assistantAt = 0;
+    activityAt = 0;
   } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch { /* already closed */ }
   }
-  transcriptCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, at });
-  return at;
+  const value = { size: stat.size, mtimeMs: stat.mtimeMs, assistantAt, activityAt };
+  transcriptCache.set(file, value);
+  return value;
 }
 
-function lastResponseForPane(session, pane, status, options, envIds) {
-  const transcriptPath = transcriptForPane(pane, status, options, envIds);
+function lastResponseForPane(session, pane, status, transcriptPath, allowTranscript, options) {
   const response = readResponseStatus(session, pane.pane, options.statusDir || config.statusDir);
   if (response) {
     if (response.transcriptPath && transcriptPath && response.transcriptPath === transcriptPath) return response.lastResponseAt;
     if (!response.transcriptPath && response.lastResponseAt >= (pane.startedAt || 0)) return response.lastResponseAt;
     if (!transcriptPath && response.lastResponseAt >= (pane.startedAt || 0)) return response.lastResponseAt;
   }
-  return transcriptPath ? assistantTimestamp(transcriptPath) : 0;
+  return allowTranscript && transcriptPath ? transcriptTimestamps(transcriptPath).assistantAt : 0;
 }
 
 export function aggregateSessionActivity(sessionNames, livePanes, options = {}) {
   const statusDir = options.statusDir || config.statusDir;
+  const backgroundPanes = options.backgroundPanes || new Map();
   const envIds = sessionEnvIds(options.sessionEnvDir || config.sessionEnvDir);
   const result = {};
+  const statesBySession = new Map();
+  const transcriptSessions = new Map();
   for (const name of sessionNames) {
     const panes = [...livePanes.values()].filter((pane) => pane.session === name);
     if (!panes.length) {
-      result[name] = { state: 'absent', updatedAt: 0, lastResponseAt: 0 };
+      result[name] = { state: 'absent', updatedAt: 0, lastResponseAt: 0, lastActivityAt: 0 };
       continue;
     }
     const states = panes.map((pane) => {
@@ -216,17 +309,61 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
         && (!pane.startedAt || raw.updatedAt >= pane.startedAt)
         ? raw
         : null;
-      return { pane, status };
+      const transcriptPath = transcriptForPane(pane, status, options, envIds);
+      if (transcriptPath) {
+        if (!transcriptSessions.has(transcriptPath)) transcriptSessions.set(transcriptPath, new Set());
+        transcriptSessions.get(transcriptPath).add(name);
+      }
+      const rawBackground = readBackgroundStatus(name, pane.pane, statusDir);
+      const backgroundStatus = rawBackground
+        && (!pane.startedAt || rawBackground.updatedAt >= pane.startedAt)
+        && (!rawBackground.transcriptPath || !transcriptPath || rawBackground.transcriptPath === transcriptPath)
+        ? rawBackground
+        : null;
+      const processBackground = backgroundPanes.get(`${name}\0${pane.pane}`);
+      const transcriptId = transcriptPath ? path.basename(transcriptPath, '.jsonl') : null;
+      const hasBackgroundProcess = Boolean(processBackground)
+        && (!transcriptId || processBackground.sessionIds?.includes(transcriptId));
+      return { pane, status, transcriptPath, backgroundStatus, processBackground, hasBackgroundProcess };
     });
-    const lastResponseAt = Math.max(0, ...states.map(({ pane, status }) => (
-      lastResponseForPane(name, pane, status, { ...options, statusDir }, envIds)
-    )));
+    statesBySession.set(name, states);
+  }
+
+  for (const [name, states] of statesBySession) {
+    const lastResponseAt = Math.max(0, ...states.map(({ pane, status, transcriptPath }) => {
+      const uniqueTranscript = !transcriptPath || transcriptSessions.get(transcriptPath)?.size === 1;
+      return lastResponseForPane(name, pane, status, transcriptPath, uniqueTranscript, { ...options, statusDir });
+    }));
+    const lastActivityAt = Math.max(lastResponseAt, ...states.map(({ status, transcriptPath }) => {
+      const hookAt = status?.updatedAt || 0;
+      const transcriptAt = transcriptPath && transcriptSessions.get(transcriptPath)?.size === 1
+        ? transcriptTimestamps(transcriptPath).activityAt
+        : 0;
+      return Math.max(hookAt, transcriptAt);
+    }));
     const busy = states.filter(({ status }) => status?.state === 'busy');
     if (busy.length) {
       result[name] = {
         state: 'busy',
         updatedAt: Math.max(...busy.map(({ status }) => status.updatedAt)),
         lastResponseAt,
+        lastActivityAt,
+      };
+      continue;
+    }
+    const background = states.filter(({ hasBackgroundProcess }) => hasBackgroundProcess);
+    if (background.length) {
+      const backgroundActivityAt = Math.max(...background.map(({ backgroundStatus, processBackground }) => (
+        Math.max(
+          processBackground?.activityAt || processBackground?.startedAt || 0,
+          backgroundStatus?.taskCount > 0 ? backgroundStatus.updatedAt : 0
+        )
+      )));
+      result[name] = {
+        state: 'background',
+        updatedAt: backgroundActivityAt,
+        lastResponseAt,
+        lastActivityAt: Math.max(lastActivityAt, backgroundActivityAt),
       };
       continue;
     }
@@ -235,6 +372,7 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
         state: 'unknown',
         updatedAt: Math.max(...states.map(({ pane }) => pane.startedAt || 0)),
         lastResponseAt,
+        lastActivityAt,
       };
       continue;
     }
@@ -242,11 +380,17 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
       state: 'idle',
       updatedAt: Math.max(...states.map(({ pane, status }) => status?.updatedAt || pane.startedAt || 0)),
       lastResponseAt,
+      lastActivityAt,
     };
   }
   return result;
 }
 
 export function collectSessionActivity(sessionNames, options = {}) {
-  return aggregateSessionActivity(sessionNames, readLiveClaudePanes(options.procRoot), options);
+  const procRoot = options.procRoot || '/proc';
+  const snapshot = readProcessSnapshot(procRoot);
+  return aggregateSessionActivity(sessionNames, snapshot.claudePanes, {
+    ...options,
+    backgroundPanes: snapshot.backgroundPanes,
+  });
 }

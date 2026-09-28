@@ -76,7 +76,11 @@ class FakeAgent {
     this.uploadChannels = new Map();
     this.downloadChannels = new Map();
     this.files = new Map();
-    this.sessions = [{ name: 'demo', created: 'Created 1m 2s ago', createdAt: 1000, lastResponseAt: 2000, exited: false, current: false }];
+    this.sessions = [{
+      name: 'demo', created: 'Created 1m 2s ago', createdAt: 1000,
+      activity: 'idle', activityUpdatedAt: 2400, lastResponseAt: 2000, lastActivityAt: 2400,
+      exited: false, current: false
+    }];
   }
 
   connect(url, { badProof = false, version = 1 } = {}) {
@@ -166,7 +170,11 @@ class FakeAgent {
           error: { code: 'conflict', message: `session ${msg.params.name} already exists` }
         });
       }
-      this.sessions.push({ name: msg.params.name, created: 'Created 0s ago', createdAt: Date.now(), lastResponseAt: 0, exited: false, current: false });
+      this.sessions.push({
+        name: msg.params.name, created: 'Created 0s ago', createdAt: Date.now(),
+        activity: 'idle', activityUpdatedAt: 0, lastResponseAt: 0, lastActivityAt: 0,
+        exited: false, current: false
+      });
       return this.send({ t: 'res', id: msg.id, ok: true, result: { name: msg.params.name, unit: 'x.service' } });
     }
     if (msg.method === 'sessions.rename') {
@@ -358,7 +366,7 @@ check('a correct proof authenticates and agent.ready is recorded', async () => {
 check('status snapshots are retained and appear in state and the authenticated event stream', async () => {
   live.send({
     t: 'event', event: 'sessions.status',
-    data: { sessions: { demo: { state: 'busy', updatedAt: 123456789, lastResponseAt: 2000 } } }
+    data: { sessions: { demo: { state: 'busy', updatedAt: 123456789, lastResponseAt: 2000, lastActivityAt: 123456789 } } }
   });
   await waitFor(async () => {
     const state = await api('GET', '/api/state', { cookie });
@@ -366,6 +374,7 @@ check('status snapshots are retained and appear in state and the authenticated e
   }, 5000, 'retained status snapshot');
   const statusState = await api('GET', '/api/state', { cookie });
   assert.equal(statusState.json.session_status.demo.lastResponseAt, 2000);
+  assert.equal(statusState.json.session_status.demo.lastActivityAt, 123456789);
 
   const controller = new AbortController();
   const stream = await fetch(`http://127.0.0.1:${PORT}/api/events`, { headers: { cookie }, signal: controller.signal });
@@ -374,6 +383,49 @@ check('status snapshots are retained and appear in state and the authenticated e
   assert.match(Buffer.from(first.value).toString('utf8'), /event: state/);
   assert.match(Buffer.from(first.value).toString('utf8'), /"busy"/);
   controller.abort();
+});
+
+check('recents are strictly descending by the reported activity timestamp', async () => {
+  const originalSessions = live.sessions;
+  const points = {
+    'session-a': Date.parse('2026-09-28T22:45:17.000Z'),
+    'session-b': Date.parse('2026-09-28T22:45:16.000Z'),
+    'session-c': Date.parse('2026-09-28T22:43:02.000Z'),
+    'session-d': Date.parse('2026-09-28T22:44:50.000Z'),
+    'session-e': Date.parse('2026-09-28T22:23:18.000Z'),
+  };
+  live.sessions = Object.entries(points).map(([name, lastActivityAt], index) => ({
+    name, created: 'Created 1h ago', createdAt: 1000 + index,
+    activity: name === 'session-c' ? 'busy' : 'idle',
+    activityUpdatedAt: lastActivityAt, lastActivityAt, lastResponseAt: 0,
+    exited: false, current: false,
+  }));
+  live.send({
+    t: 'event', event: 'sessions.status',
+    data: {
+      sessions: Object.fromEntries(live.sessions.map((session) => [session.name, {
+        state: session.activity,
+        updatedAt: session.activityUpdatedAt,
+        lastActivityAt: session.lastActivityAt,
+        lastResponseAt: 0,
+      }]))
+    }
+  });
+  const expected = ['session-a', 'session-b', 'session-d', 'session-c', 'session-e'];
+  await waitFor(async () => {
+    const state = await api('GET', '/api/state', { cookie });
+    return state.json?.recents?.length === 5;
+  }, 5000, 'five reported recents');
+  const state = await api('GET', '/api/state', { cookie });
+  assert.deepEqual(state.json.recents.map((entry) => entry.session_name), expected);
+  assert.deepEqual(state.json.recents.map((entry) => entry.last_activity_at), expected.map((name) => points[name]));
+  assert.equal(state.json.recents.every((entry, index, rows) => index === 0 || rows[index - 1].last_activity_at >= entry.last_activity_at), true);
+
+  live.sessions = originalSessions;
+  live.send({
+    t: 'event', event: 'sessions.status',
+    data: { sessions: { demo: { state: 'busy', updatedAt: 123456789, lastResponseAt: 2000, lastActivityAt: 123456789 } } }
+  });
 });
 
 check('a second agent is refused with 4409', async () => {
@@ -418,23 +470,41 @@ check('creating a session calls the agent and files a leaf', async () => {
   assert.ok(live.sessions.some((s) => s.name === 'built'), 'the agent was asked to create it');
 });
 
-check('recents rank by the last agent response and opening does not change the order', async () => {
+check('recents rank by live agent activity and opening does not change the order', async () => {
   const limit = await api('PUT', '/api/preferences/recent-limit', { cookie, body: { recent_limit: 3 } });
   assert.equal(limit.status, 200);
   assert.equal(limit.json.recent_limit, 3);
   let state = await api('GET', '/api/state', { cookie });
   assert.equal(state.json.recent_limit, 3);
   assert.deepEqual(state.json.recents.map((entry) => entry.session_name), ['demo', 'built']);
+  live.send({
+    t: 'event', event: 'sessions.status',
+    data: { sessions: { demo: { state: 'idle', updatedAt: 2400, lastResponseAt: 2000, lastActivityAt: 2400 } } }
+  });
+  await waitFor(async () => {
+    const current = await api('GET', '/api/state', { cookie });
+    return current.json?.session_status?.demo?.state === 'idle';
+  }, 5000, 'idle activity snapshot');
   const built = live.sessions.find((session) => session.name === 'built');
-  built.lastResponseAt = 3000;
+  built.activityUpdatedAt = 3000;
+  built.lastActivityAt = 3000;
+  live.sessions.find((session) => session.name === 'demo').lastActivityAt = 9000;
   state = await api('GET', '/api/state', { cookie });
   assert.deepEqual(state.json.recents.map((entry) => entry.session_name), ['built', 'demo']);
-  assert.equal(state.json.recents[0].last_response_at, 3000);
+  assert.equal(state.json.recents[0].last_activity_at, 3000);
+  live.send({
+    t: 'event', event: 'sessions.status',
+    data: { sessions: { demo: { state: 'busy', updatedAt: 2500, lastResponseAt: 2000, lastActivityAt: 4000 } } }
+  });
+  await waitFor(async () => {
+    const current = await api('GET', '/api/state', { cookie });
+    return current.json?.recents?.[0]?.session_name === 'demo';
+  }, 5000, 'busy session first');
   const opened = await api('POST', '/api/sessions/demo/open', { cookie, body: {} });
   assert.equal(opened.status, 200);
-  assert.deepEqual(opened.json.recents.map((entry) => entry.session_name), ['built', 'demo']);
+  assert.deepEqual(opened.json.recents.map((entry) => entry.session_name), ['demo', 'built']);
   state = await api('GET', '/api/state', { cookie });
-  assert.deepEqual(state.json.recents.map((entry) => entry.session_name), ['built', 'demo']);
+  assert.deepEqual(state.json.recents.map((entry) => entry.session_name), ['demo', 'built']);
 
   const missing = await api('POST', '/api/sessions/not-live/open', { cookie, body: {} });
   assert.equal(missing.status, 404);
@@ -463,7 +533,7 @@ check('renaming a session updates the agent and the stored leaf', async () => {
   assert.ok(live.sessions.some((s) => s.name === 'built-renamed'));
   assert.ok(!live.sessions.some((s) => s.name === 'built'));
   const state = await api('GET', '/api/state', { cookie });
-  assert.equal(state.json.recents[0].session_name, 'built-renamed');
+  assert.ok(state.json.recents.some((entry) => entry.session_name === 'built-renamed'));
   assert.equal(state.json.sessions.find((session) => session.name === 'built-renamed').originalCreatedAt, originalCreatedAt);
 });
 

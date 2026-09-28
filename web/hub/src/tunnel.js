@@ -55,11 +55,17 @@ function normalizeSessionStatus(data) {
   const out = {};
   for (const [name, value] of Object.entries(sessions)) {
     if (typeof name !== 'string' || !name) continue;
-    if (!value || !['busy', 'idle', 'absent', 'unknown'].includes(value.state)) continue;
+    if (!value || !['busy', 'background', 'idle', 'absent', 'unknown'].includes(value.state)) continue;
+    const updatedAt = Math.max(0, Number(value.updatedAt) || 0);
+    const lastResponseAt = Math.max(0, Number(value.lastResponseAt) || 0);
+    const lastActivityAt = Object.hasOwn(value, 'lastActivityAt')
+      ? Math.max(0, Number(value.lastActivityAt) || 0)
+      : (updatedAt || lastResponseAt);
     out[name] = {
       state: value.state,
-      updatedAt: Number(value.updatedAt) || Date.now(),
-      lastResponseAt: Math.max(0, Number(value.lastResponseAt) || 0)
+      updatedAt,
+      lastResponseAt,
+      lastActivityAt
     };
   }
   return out;

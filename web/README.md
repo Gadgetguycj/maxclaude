@@ -65,9 +65,9 @@ The agent configuration uses `MCW_HUB_URL` and its configured secret file. [The 
 
 The sidebar is a nested folder tree. Folders are hub metadata. Session leaves represent real maxclaude sessions on the agent host. Sessions created outside the browser appear in Unfiled.
 
-Status lights report the activity of real Claude Code panes. Green indicates busy, orange indicates idle, gray indicates no active Claude process, and an unknown state means the agent has not received a current activity record. The status hooks report prompts, tool activity, completion, and notifications.
+Status lights report the activity of real Claude Code panes. Blinking green indicates foreground work. A slower green pulse indicates a live background task. Orange indicates idle, gray indicates no active Claude process, and an unknown state means the agent has not received a current activity record. Reduced-motion users receive solid green activity lights. The status hooks report prompts, activity before and after tools, completion, and notifications.
 
-Recent sessions lists sessions by their most recent completed response. Opening a terminal does not change that order. The setting can show 3, 5, 10, or 15 sessions, or turn the list off.
+Recent sessions lists sessions by their latest real activity event. The list reorders while the page remains open, and reloading produces the same order. Opening a terminal does not change that order. The setting can show 3, 5, 10, or 15 sessions, or turn the list off.
 
 The browser keeps recently used terminal connections warm. Switching between warm sessions avoids reconnecting the terminal when capacity permits. One terminal is visible at a time.
 

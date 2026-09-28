@@ -71,19 +71,28 @@ function recentSessions(sessions, limit, sessionStatus = {}) {
   if (!limit) return [];
   return (sessions || [])
     .filter((session) => session?.name && !session.exited)
-    .map((session) => ({
-      session_name: session.name,
-      last_response_at: Math.max(
-        0,
-        Number(sessionStatus[session.name]?.lastResponseAt) || 0,
-        Number(session.lastResponseAt) || 0
-      )
-    }))
+    .map((session) => {
+      const status = sessionStatus[session.name] || {};
+      const statusActivity = Object.hasOwn(status, 'lastActivityAt')
+        ? Number(status.lastActivityAt) || 0
+        : (Number(status.updatedAt) || Number(status.lastResponseAt) || 0);
+      const sessionActivity = Object.hasOwn(session, 'lastActivityAt')
+        ? Number(session.lastActivityAt) || 0
+        : (Number(session.activityUpdatedAt) || Number(session.lastResponseAt) || 0);
+      const lastActivityAt = Object.hasOwn(sessionStatus, session.name)
+        ? Math.max(0, statusActivity)
+        : Math.max(0, sessionActivity);
+      return {
+        session_name: session.name,
+        last_activity_at: lastActivityAt
+      };
+    })
     .sort((left, right) => (
-      right.last_response_at - left.last_response_at
+      right.last_activity_at - left.last_activity_at
       || left.session_name.localeCompare(right.session_name)
     ))
-    .slice(0, limit);
+    .slice(0, limit)
+    .map(({ session_name, last_activity_at }) => ({ session_name, last_activity_at }));
 }
 
 function sessionsWithOriginalCreationTimes(sessions) {

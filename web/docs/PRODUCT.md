@@ -15,7 +15,7 @@ Creating a session requests the configured maxclaude launch flow. A session can 
 
 Deleting a session stops and removes the live session through the configured local tools. Deleting a folder never silently deletes its session children. The browser asks how to handle children first.
 
-The hub preserves each session's earliest observed creation time so moving or renaming a session does not make it appear new. Recent sessions are sorted by the latest completed response, not by a browser visit.
+The hub preserves each session's earliest observed creation time so moving or renaming a session does not make it appear new. Recent sessions are sorted by the latest real activity event. A browser visit does not affect the order.
 
 ## Activity and status
 
@@ -24,11 +24,16 @@ The optional status helper receives Claude Code hook events. It writes an atomic
 | State | Meaning |
 | --- | --- |
 | Busy | At least one live pane reported prompt or tool activity. |
+| Background | A matching live task process descends from the pane's current Claude Code process. |
 | Idle | A live Claude Code process exists and no pane is busy. |
 | Absent | No Claude Code process exists in the session. |
 | Unknown | A live process has no current valid hook record. |
 
-The helper must not affect Claude Code if status reporting fails. It exits successfully after handling an event. The hook installer merges the web hooks with existing hook arrays and keeps unrelated settings intact.
+Busy uses a blinking green light. Background work uses a slower green pulse. Both lights become solid green when reduced motion is requested.
+
+The helper records prompt submission, work before and after each tool, completion, and notifications. It must not affect Claude Code if status reporting fails. It exits successfully after handling an event. The hook installer merges the web hooks with existing hook arrays and keeps unrelated settings intact.
+
+Recent uses each session's latest hook event. A unique current transcript can contribute its latest user or assistant message. Shared transcripts cannot transfer activity between sessions. Background state requires live process evidence and clears after that process exits. The server and browser use the same timestamp and session-name tie breaker, so live sorting and reload sorting agree.
 
 ## Terminal access
 

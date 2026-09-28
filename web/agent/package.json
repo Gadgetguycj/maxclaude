@@ -7,9 +7,10 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "npm run test:files && npm run test:status && npm run test:wsgate",
+    "test": "npm run test:files && npm run test:status && npm run test:hooks && npm run test:wsgate",
     "test:files": "node test/files.mjs",
     "test:status": "node test/status.mjs",
+    "test:hooks": "node test/install-hooks.mjs",
     "test:wsgate": "node test/wsgate.mjs",
     "test:integration": "node test/integration.mjs"
   },
