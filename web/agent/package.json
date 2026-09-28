@@ -1,0 +1,22 @@
+{
+  "name": "maxclaude-web-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "maxclaude web agent of maxclaude-web: outbound tunnel, zellij web proxy, maxclaude session control",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "npm run test:files && npm run test:status && npm run test:wsgate",
+    "test:files": "node test/files.mjs",
+    "test:status": "node test/status.mjs",
+    "test:wsgate": "node test/wsgate.mjs",
+    "test:integration": "node test/integration.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

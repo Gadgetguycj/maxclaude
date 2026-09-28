@@ -19,6 +19,7 @@
 #   --safe                        start Claude with normal permission prompts
 #   --zellij-version vX.Y.Z       zellij release to fetch if missing (default: v0.44.3)
 #   --no-systemd                  skip systemd units; rely on zellij persistence
+#   --with-web-agent              install the optional web agent after core tools
 #   -y, --yes                     non-interactive; take defaults / flags
 #   -h, --help                    show this help
 set -euo pipefail
@@ -38,6 +39,7 @@ CODEX_DANGEROUS=""
 ASSUME_YES=""
 WANT_SYSTEMD="auto"
 PROVIDER_EXPLICIT=""
+WANT_WEB_AGENT=""
 
 BIN_DIR="$HOME/.local/bin"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -117,6 +119,7 @@ while [ $# -gt 0 ]; do
     --zellij-version) shift; ZELLIJ_VERSION="${1:?--zellij-version needs a value}" ;;
     --zellij-version=*) ZELLIJ_VERSION="${1#*=}" ;;
     --no-systemd) WANT_SYSTEMD="no" ;;
+    --with-web-agent) WANT_WEB_AGENT=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
@@ -472,6 +475,13 @@ if [ -n "$USE_SYSTEMD" ]; then
   else
     ok "lingering enabled (sessions survive SSH disconnect)"
   fi
+fi
+
+if [ -n "$WANT_WEB_AGENT" ]; then
+  step "Web agent"
+  [ -x "$SRC_DIR/web/agent/install.sh" ] || die "web agent installer is missing from this source tree"
+  "$SRC_DIR/web/agent/install.sh" --install-hooks
+  ok "web agent installed; configure it as described in web/README.md"
 fi
 
 case ":$PATH:" in

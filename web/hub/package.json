@@ -1,0 +1,21 @@
+{
+  "name": "maxclaude-web",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser control plane for maxclaude zellij sessions",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/protocol.mjs && node test/sizing.mjs && node test/warm.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2",
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2",
+    "ws": "^8.18.3"
+  }
+}

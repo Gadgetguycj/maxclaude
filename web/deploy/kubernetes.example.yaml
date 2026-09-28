@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maxclaude-web-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maxclaude-web
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: maxclaude-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: maxclaude-web
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: hub
+          image: registry.example.com/maxclaude-web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HOST
+              value: 0.0.0.0
+            - name: PORT
+              value: "8080"
+            - name: DATA_DIR
+              value: /data
+            - name: COOKIE_SECURE
+              value: "true"
+            - name: OPERATOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: maxclaude-web-secrets
+                  key: operator-password
+            - name: AGENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: maxclaude-web-secrets
+                  key: agent-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: maxclaude-web-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maxclaude-web
+spec:
+  selector:
+    app.kubernetes.io/name: maxclaude-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: maxclaude-web-ui
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - hub.example.com
+      secretName: maxclaude-web-ui-tls
+  rules:
+    - host: hub.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: maxclaude-web
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: maxclaude-web-agent
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - agent.example.com
+      secretName: maxclaude-web-agent-tls
+  rules:
+    - host: agent.example.com
+      http:
+        paths:
+          - path: /agent
+            pathType: Exact
+            backend:
+              service:
+                name: maxclaude-web
+                port:
+                  name: http

@@ -73,6 +73,7 @@ The installer:
 | `--safe` | start Claude with normal permission prompts |
 | `--zellij-version vX.Y.Z` | zellij release to fetch when missing |
 | `--no-systemd` | skip systemd units; rely on zellij's own persistence |
+| `--with-web-agent` | install the optional web agent after the core tools |
 | `-y`, `--yes` | take defaults/flags without prompting |
 
 Codex defaults are intentionally safe and interactive. Installing with
@@ -208,6 +209,21 @@ change their launch flags, edit:
 
 Running panes keep the command they started with. Close and reopen a session
 after changing a provider profile.
+
+## Web Version
+
+The optional web version gives one operator a browser interface for managing
+Claude Code sessions on connected machines. Install its agent alongside the
+core tools with:
+
+```bash
+MCW_HUB_URL=wss://hub.example.com/agent \
+MCW_AGENT_SECRET='replace-with-the-hub-agent-secret' \
+  ./install.sh --with-web-agent
+```
+
+The flag does not change a normal installation. Follow the configuration and
+privacy guidance in [web/README.md](web/README.md) before starting the agent.
 
 ## Router Mode (maxrouter)
 
