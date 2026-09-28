@@ -1,6 +1,5 @@
 [Unit]
 Description=Persistent agent zellij workspace (named %I)
-Documentation=man:zellij(1)
 After=default.target
 
 [Service]

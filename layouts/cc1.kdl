@@ -1,4 +1,4 @@
-// maxagent 2 - two persistent agent panes, side by side.
+// maxclaude 1 - single persistent Claude pane.
 layout {
     default_tab_template {
         children
@@ -35,14 +35,11 @@ layout {
             }
         }
     }
-    pane_template name="agent" {
+    pane_template name="cc" {
         command "bash"
-        args "-lc" "exec $HOME/.local/bin/maxagent-pane"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
     }
-    tab name="agent" focus=true {
-        pane split_direction="vertical" {
-            agent
-            agent
-        }
+    tab name="claude" focus=true {
+        cc
     }
 }

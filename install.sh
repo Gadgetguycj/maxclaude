@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # maxagent installer.
 #
-# Installs maxagent, maxcodex, maxclaude compatibility wrappers, zellij layouts,
-# provider profiles, optional per-user systemd services, and zellij if missing.
+# Installs maxagent, maxcodex, the legacy maxclaude launcher, zellij layouts,
+# provider profiles, the maxrouter router-mode tools (mxr, maxrouter, web GUI),
+# optional per-user systemd services, and zellij if missing.
 #
 # Quick start (from a clone):     ./install.sh --provider codex
 # Or straight from GitHub:        curl -fsSL https://raw.githubusercontent.com/Gadgetguycj/maxclaude/main/install.sh | bash
@@ -24,6 +25,8 @@ set -euo pipefail
 
 REPO="Gadgetguycj/maxclaude"
 ZELLIJ_VERSION="v0.44.3"
+ZJSTATUS_VERSION="v0.24.0"
+ZJSTATUS_SHA256="1ccedece1ded62cf3e209be690cdd39ca6fb9e8228ed71a951f6507f9956669b"
 DEFAULT_PROVIDER="codex"
 WORKDIR="$HOME"
 CLAUDE_YOLO=""
@@ -42,15 +45,17 @@ AGENT_CFG_DIR="$CFG_DIR/maxagent"
 PROFILE_DIR="$AGENT_CFG_DIR/profiles"
 SESSION_DIR="$AGENT_CFG_DIR/sessions"
 LAYOUT_DIR="$CFG_DIR/zellij/layouts"
+PLUGIN_DIR="$CFG_DIR/zellij/plugins"
+ZELLIJ_CONFIG="$CFG_DIR/zellij/config.kdl"
 UNIT_DIR="$CFG_DIR/systemd/user"
 
 c_bold=$'\033[1m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 say(){ printf '%s\n' "$*"; }
-ok(){ printf '%s✓%s %s\n' "$c_grn" "$c_off" "$*"; }
+ok(){ printf '%s[ok]%s %s\n' "$c_grn" "$c_off" "$*"; }
 warn(){ printf '%s!%s %s\n' "$c_ylw" "$c_off" "$*" >&2; }
-die(){ printf '%s✗ %s%s\n' "$c_red" "$*" "$c_off" >&2; exit 1; }
+die(){ printf '%s[error] %s%s\n' "$c_red" "$*" "$c_off" >&2; exit 1; }
 step(){ printf '\n%s== %s ==%s\n' "$c_bold" "$*" "$c_off"; }
-usage(){ if [ -r "$0" ]; then sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'; else echo "maxagent installer — see https://github.com/$REPO"; fi; }
+usage(){ if [ -r "$0" ]; then sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d; s/^# \{0,1\}//'; else echo "maxagent installer - see https://github.com/$REPO"; fi; }
 
 ask(){
   local prompt="$1" default="$2" reply=""
@@ -130,8 +135,10 @@ fi
 # given. A prior Claude-only "maxclaude" install (no ~/.config/maxagent) keeps
 # defaulting to Claude instead of silently flipping to Codex.
 PREV_PROVIDER=""
-[ -r "$AGENT_CFG_DIR/defaults.env" ] && \
+if [ -r "$AGENT_CFG_DIR/defaults.env" ]; then
+  # shellcheck disable=SC1091
   PREV_PROVIDER="$(. "$AGENT_CFG_DIR/defaults.env" 2>/dev/null; printf '%s' "${MAXAGENT_DEFAULT_PROVIDER:-}")"
+fi
 if [ -z "$PROVIDER_EXPLICIT" ]; then
   if [ -n "$PREV_PROVIDER" ]; then
     DEFAULT_PROVIDER="$PREV_PROVIDER"
@@ -143,7 +150,7 @@ elif [ -n "$PREV_PROVIDER" ] && [ "$PREV_PROVIDER" != "$DEFAULT_PROVIDER" ]; the
 fi
 case "$DEFAULT_PROVIDER" in codex|claude) ;; *) DEFAULT_PROVIDER="codex" ;; esac
 
-SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+if SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"; then :; else SRC_DIR=""; fi
 have_sources(){ [ -f "$SRC_DIR/bin/maxagent" ] && [ -d "$SRC_DIR/layouts" ]; }
 if ! have_sources; then
   step "Fetching maxagent sources"
@@ -173,7 +180,7 @@ if [ "$WANT_SYSTEMD" = "no" ]; then
 elif has_systemd; then
   USE_SYSTEMD=1
 else
-  [ "$uname_s" = "Linux" ] && warn "no working 'systemctl --user' — falling back to zellij's own session persistence"
+  [ "$uname_s" = "Linux" ] && warn "no working 'systemctl --user' - falling back to zellij's own session persistence"
 fi
 
 step "maxagent installer"
@@ -187,7 +194,9 @@ say "  persistence  : $([ -n "$USE_SYSTEMD" ] && echo 'systemd --user service (s
 step "Dependency: zellij"
 mkdir -p "$BIN_DIR"
 install_zellij_from_release(){
-  [ -n "$zarch" ] && [ -n "$zplat" ] || die "no zellij prebuilt for $uname_s/$uname_m — install zellij manually then re-run"
+  if [ -z "$zarch" ] || [ -z "$zplat" ]; then
+    die "no zellij prebuilt for $uname_s/$uname_m - install zellij manually then re-run"
+  fi
   local asset="zellij-${zarch}-${zplat}.tar.gz" url tmp
   url="https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/${asset}"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
@@ -208,10 +217,42 @@ elif command -v zellij >/dev/null 2>&1; then
   ok "linked existing zellij ($sysz -> $BIN_DIR/zellij, $("$sysz" --version 2>/dev/null || echo '?'))"
 else
   ans="$(ask "zellij is not installed. Download it now? [Y/n] " "Y")"
-  case "$ans" in [Nn]*) die "zellij is required — install it then re-run" ;; esac
+  case "$ans" in [Nn]*) die "zellij is required - install it then re-run" ;; esac
   install_zellij_from_release
   ok "installed zellij ($("$BIN_DIR/zellij" --version 2>/dev/null || echo '?'))"
 fi
+
+step "Dependency: zjstatus"
+mkdir -p "$PLUGIN_DIR"
+zjstatus="$PLUGIN_DIR/zjstatus.wasm"
+zjstatus_ok=""
+if [ -f "$zjstatus" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    [ "$(sha256sum "$zjstatus" | awk '{print $1}')" = "$ZJSTATUS_SHA256" ] && zjstatus_ok=1
+  elif command -v shasum >/dev/null 2>&1; then
+    [ "$(shasum -a 256 "$zjstatus" | awk '{print $1}')" = "$ZJSTATUS_SHA256" ] && zjstatus_ok=1
+  fi
+fi
+if [ -z "$zjstatus_ok" ]; then
+  zjstatus_tmp="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "https://github.com/dj95/zjstatus/releases/download/${ZJSTATUS_VERSION}/zjstatus.wasm" -o "$zjstatus_tmp"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$zjstatus_tmp" "https://github.com/dj95/zjstatus/releases/download/${ZJSTATUS_VERSION}/zjstatus.wasm"
+  else
+    die "need curl or wget to download zjstatus"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    zjstatus_sum="$(sha256sum "$zjstatus_tmp" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    zjstatus_sum="$(shasum -a 256 "$zjstatus_tmp" | awk '{print $1}')"
+  else
+    die "need sha256sum or shasum to verify zjstatus"
+  fi
+  [ "$zjstatus_sum" = "$ZJSTATUS_SHA256" ] || die "zjstatus checksum mismatch"
+  install -m 0644 "$zjstatus_tmp" "$zjstatus"
+fi
+ok "zjstatus  -> $zjstatus"
 
 CODEX_BIN="$(find_exe codex)"
 CLAUDE_BIN="$(find_exe claude)"
@@ -245,15 +286,28 @@ install -m 0755 "$SRC_DIR/bin/maxcodex" "$BIN_DIR/maxcodex"
 install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
-# Drop artifacts from older maxclaude installs that this layout no longer uses
-# (maxclaude-svc is now just maxagent-svc; the per-pane launcher is maxagent-pane).
-rm -f "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
+install -m 0755 "$SRC_DIR/bin/maxagent-usage" "$BIN_DIR/maxagent-usage"
+# maxclaude-svc, maxclaude-pane and the cc* layouts are NOT removed here: they
+# are the router-mode pane path, installed in the router section below.
 ok "commands  -> $BIN_DIR/maxagent, maxcodex, maxclaude"
 
 mkdir -p "$LAYOUT_DIR"
 install -m 0644 "$SRC_DIR"/layouts/agent{1,2,3,4}.kdl "$LAYOUT_DIR/"
-rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
 ok "layouts   -> $LAYOUT_DIR/agent{1,2,3,4}.kdl"
+
+mkdir -p "$(dirname "$ZELLIJ_CONFIG")"
+zellij_cfg_tmp="$(mktemp)"
+if [ -f "$ZELLIJ_CONFIG" ]; then
+  awk '
+    /^[[:space:]]*web_sharing[[:space:]]+/ { print "web_sharing \"on\""; found=1; next }
+    { print }
+    END { if (!found) print "web_sharing \"on\"" }
+  ' "$ZELLIJ_CONFIG" > "$zellij_cfg_tmp"
+else
+  printf 'web_sharing "on"\n' > "$zellij_cfg_tmp"
+fi
+install -m 0644 "$zellij_cfg_tmp" "$ZELLIJ_CONFIG"
+ok "zellij    -> web_sharing on in $ZELLIJ_CONFIG"
 
 mkdir -p "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR"
 chmod 0700 "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR" 2>/dev/null || true
@@ -325,17 +379,94 @@ MAXAGENT_WORKDIR=$(shell_quote "$WORKDIR")
 EOF
 )
 
+step "Router mode (maxrouter)"
+ROUTER_CFG_DIR="${MAXROUTER_CONFIG_HOME:-$CFG_DIR/maxclaude}"
+install -m 0755 "$SRC_DIR/bin/mxr" "$BIN_DIR/mxr"
+install -m 0755 "$SRC_DIR/bin/maxrouter" "$BIN_DIR/maxrouter"
+install -m 0755 "$SRC_DIR/bin/maxclaude-pane" "$BIN_DIR/maxclaude-pane"
+install -m 0755 "$SRC_DIR/bin/maxclaude-restore" "$BIN_DIR/maxclaude-restore"
+install -m 0755 "$SRC_DIR/bin/mxr-outbox" "$BIN_DIR/mxr-outbox"
+install -m 0755 "$SRC_DIR/bin/mxr-notify" "$BIN_DIR/mxr-notify"
+install -m 0755 "$SRC_DIR/bin/mxr-notifyd" "$BIN_DIR/mxr-notifyd"
+install -m 0755 "$SRC_DIR/bin/mxr-blockd" "$BIN_DIR/mxr-blockd"
+install -m 0755 "$SRC_DIR/bin/mxr-heartbeatd" "$BIN_DIR/mxr-heartbeatd"
+install -m 0755 "$SRC_DIR/bin/maxrouter-webd" "$BIN_DIR/maxrouter-webd"
+ok "commands  -> router tools, maxclaude-pane, and maxclaude-restore in $BIN_DIR"
+# Router pane path (maxclaude-named@ -> maxclaude-svc -> cc* layouts): install
+# only when missing so a live box's tuned copies are kept.
+if [ ! -x "$BIN_DIR/maxclaude-svc" ]; then
+  install -m 0755 "$SRC_DIR/bin/maxclaude-svc" "$BIN_DIR/maxclaude-svc"
+  ok "command   -> $BIN_DIR/maxclaude-svc"
+else
+  ok "command   -> $BIN_DIR/maxclaude-svc (kept)"
+fi
+cc_installed=""
+for n in 1 2 3 4; do
+  if [ ! -f "$LAYOUT_DIR/cc${n}.kdl" ]; then
+    install -m 0644 "$SRC_DIR/layouts/cc${n}.kdl" "$LAYOUT_DIR/"
+    cc_installed=1
+  fi
+done
+if [ -n "$cc_installed" ]; then
+  ok "layouts   -> $LAYOUT_DIR/cc{1,2,3,4}.kdl"
+else
+  ok "layouts   -> $LAYOUT_DIR/cc{1,2,3,4}.kdl (kept)"
+fi
+mkdir -p "$ROUTER_CFG_DIR/sessions" "$ROUTER_CFG_DIR/router/outbox"
+if [ ! -f "$ROUTER_CFG_DIR/orgs.json" ]; then
+  install -m 0644 "$SRC_DIR/orgs.json.example" "$ROUTER_CFG_DIR/orgs.json"
+  ok "orgs      -> $ROUTER_CFG_DIR/orgs.json (seeded from orgs.json.example; edit to taste)"
+else
+  ok "orgs      -> $ROUTER_CFG_DIR/orgs.json (kept)"
+fi
+if [ ! -f "$ROUTER_CFG_DIR/router/CLAUDE.md" ]; then
+  install -m 0644 "$SRC_DIR/share/router-CLAUDE.md" "$ROUTER_CFG_DIR/router/CLAUDE.md"
+  ok "router    -> $ROUTER_CFG_DIR/router/CLAUDE.md"
+else
+  ok "router    -> $ROUTER_CFG_DIR/router/CLAUDE.md (kept)"
+fi
+# Worker Stop hook must point at THIS install's mxr-outbox (absolute path).
+if [ ! -f "$ROUTER_CFG_DIR/router/worker-settings.json" ]; then
+  cat > "$ROUTER_CFG_DIR/router/worker-settings.json" <<EOF
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$BIN_DIR/mxr-outbox"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+  ok "hook      -> $ROUTER_CFG_DIR/router/worker-settings.json"
+else
+  ok "hook      -> $ROUTER_CFG_DIR/router/worker-settings.json (kept)"
+fi
+
 if [ -n "$USE_SYSTEMD" ]; then
   mkdir -p "$UNIT_DIR"
   install -m 0644 "$SRC_DIR/systemd/maxagent-named@.service" "$UNIT_DIR/"
-  # Remove legacy units from older installs: every session now runs under
-  # maxagent-named@; maxagent still stops any pre-existing maxclaude@ units.
-  # Deliberately NOT stopped here: the old units' ExecStop deletes the zellij
-  # session, so stopping live ones mid-upgrade would kill running sessions.
-  # Any leftover ghost unit is cleaned by 'maxagent close' / 'maxagent prune'.
-  rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
+  install -m 0644 "$SRC_DIR/systemd/maxclaude@.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxrouter-web.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxrouter-notify.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxrouter-blockd.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxrouter-heartbeat.service" "$UNIT_DIR/"
+  # maxclaude-named@ drives the router-mode sessions; keep a live box's copy.
+  if [ ! -f "$UNIT_DIR/maxclaude-named@.service" ]; then
+    install -m 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
+  fi
   systemctl --user daemon-reload 2>/dev/null || true
-  ok "services  -> $UNIT_DIR/maxagent-named@.service"
+  # The event bridge is safe to run always (no-ops without a live router), so
+  # enable it now: replies push to the router instead of it polling on a timer.
+  systemctl --user enable --now maxrouter-notify.service 2>/dev/null || true
+  systemctl --user enable --now maxrouter-blockd.service 2>/dev/null || true
+  systemctl --user enable --now maxrouter-heartbeat.service 2>/dev/null || true
+  ok "services  -> maxagent, maxclaude, and maxrouter user units in $UNIT_DIR"
   if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
     warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"
   else
@@ -348,6 +479,7 @@ case ":$PATH:" in
   *)
     step "PATH"
     rc="$HOME/.bashrc"; [ -n "${ZSH_VERSION:-}" ] || case "${SHELL:-}" in */zsh) rc="$HOME/.zshrc" ;; esac
+    # shellcheck disable=SC2016
     line='export PATH="$HOME/.local/bin:$PATH"'
     if [ -w "$rc" ] || [ ! -e "$rc" ]; then
       grep -qsF "$line" "$rc" 2>/dev/null || { printf '\n# added by maxagent installer\n%s\n' "$line" >> "$rc"; ok "added $BIN_DIR to PATH in $rc"; }
@@ -360,12 +492,13 @@ esac
 
 step "Done"
 say "Start a Codex session:"
-say "  ${c_bold}maxcodex${c_off}        # 2x2 grid of 4 Codex panes"
+say "  ${c_bold}maxcodex${c_off}        # one Codex pane"
 say "  ${c_bold}maxcodex 2${c_off}      # two Codex panes"
 say "  ${c_bold}maxcodex work${c_off}   # named Codex workspace"
 say ""
-say "Claude compatibility still works:"
-say "  ${c_bold}maxclaude${c_off}       # legacy Claude workspace"
+say "Legacy Claude launcher:"
+say "  ${c_bold}maxclaude${c_off}       # one throwaway Claude pane"
+say "  ${c_bold}maxclaude work${c_off}  # persistent named Claude workspace"
 say ""
 say "Manage:   maxagent ls   |   maxagent attach <n>   |   maxagent close <n>"
 say "Detach:   Ctrl-o then d        Move panes: Alt+arrows        Close window: Ctrl-q"

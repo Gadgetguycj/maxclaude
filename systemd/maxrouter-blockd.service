@@ -1,0 +1,17 @@
+[Unit]
+Description=maxrouter block watcher: push [worker-blocked] to the router when a worker pane freezes on a prompt
+After=default.target
+
+[Service]
+# Samples paned worker screens on a short interval and pushes when one is stuck
+# on an interactive menu/permission/trust dialog. Lightweight (a screen dump per
+# worker every few seconds); the router never has to poll for this itself.
+Type=simple
+Environment=IS_SANDBOX=1
+ExecStart=%h/.local/bin/mxr-blockd
+Restart=always
+RestartSec=2
+
+[Install]
+# Safe to run always (no-ops with no paned workers / no live router).
+WantedBy=default.target

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# maxclaude-svc start|stop <session>
+# Invoked by maxclaude-named@.service to (re)create or tear down a persistent,
+# background zellij workspace. The pane count is read from the per-session state
+# file under the maxclaude config dir and defaults to one.
+set -euo pipefail
+ZJ="${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}"
+[ -x "$ZJ" ] || ZJ="$(command -v zellij 2>/dev/null || true)"
+[ -n "$ZJ" ] || { echo "maxclaude-svc: zellij not found" >&2; exit 127; }
+action="${1:?usage: maxclaude-svc start|stop <session>}"
+name="${2:?usage: maxclaude-svc start|stop <session>}"
+cfg="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+panes="${3:-}"
+[ -n "$panes" ] || panes="$(cat "$cfg/${name}.panes" 2>/dev/null || echo 1)"
+case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+session_is_live() {
+  "$ZJ" list-sessions -n 2>/dev/null \
+    | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -vi 'EXITED' \
+    | awk 'NF { print $1 }' \
+    | grep -qxF "$name"
+}
+case "$action" in
+  start)
+    session_is_live && exit 0
+    exec "$ZJ" --layout "cc${panes}" attach --create-background "$name"
+    ;;
+  stop)  exec "$ZJ" delete-session --force "$name" ;;
+  *) echo "unknown action: $action (want start|stop)" >&2; exit 2 ;;
+esac

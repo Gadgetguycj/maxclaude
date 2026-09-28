@@ -1,0 +1,22 @@
+{
+  "orgs": [
+    {
+      "name": "Work",
+      "aliases": ["w", "work", "job"],
+      "workdir": "~",
+      "color": "#7c5cff"
+    },
+    {
+      "name": "Personal",
+      "aliases": ["p", "me", "personal"],
+      "workdir": "~",
+      "color": "#ff7675"
+    },
+    {
+      "name": "Other",
+      "aliases": ["misc", "other"],
+      "workdir": "~",
+      "color": "#74b9ff"
+    }
+  ]
+}

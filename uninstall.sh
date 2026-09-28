@@ -33,9 +33,26 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
   systemctl --user list-units 'maxagent-named@*' 'maxclaude@*' 'maxclaude-named@*' --all --no-legend 2>/dev/null | awk '{print $1}' \
     | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1 || true; done
   for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1 || true; done
+  for u in maxrouter-web.service maxrouter-notify.service maxrouter-blockd.service maxrouter-heartbeat.service; do
+    systemctl --user disable --now "$u" >/dev/null 2>&1 || true
+  done
 fi
 
-rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" "$BIN_DIR/maxagent-svc"
+# Router mode (maxrouter): remove what install.sh's router section added.
+# User data is kept: registry.json, master-log.jsonl, orgs.json.
+MAXCLAUDE_CFG_DIR="${MAXROUTER_CONFIG_HOME:-$CFG_DIR/maxclaude}"
+rm -f "$BIN_DIR/mxr" "$BIN_DIR/maxrouter" "$BIN_DIR/mxr-outbox" \
+      "$BIN_DIR/mxr-notify" "$BIN_DIR/mxr-notifyd" "$BIN_DIR/mxr-blockd" \
+      "$BIN_DIR/mxr-heartbeatd" "$BIN_DIR/maxrouter-webd" \
+      "$BIN_DIR/maxclaude-pane" "$BIN_DIR/maxclaude-restore"
+rm -f "$UNIT_DIR/maxrouter-web.service" "$UNIT_DIR/maxrouter-notify.service" \
+      "$UNIT_DIR/maxrouter-blockd.service" "$UNIT_DIR/maxrouter-heartbeat.service"
+rm -f "$MAXCLAUDE_CFG_DIR/router/CLAUDE.md" "$MAXCLAUDE_CFG_DIR/router/worker-settings.json"
+rm -rf "$MAXCLAUDE_CFG_DIR/router/outbox" "$MAXCLAUDE_CFG_DIR/sessions"
+rmdir "$MAXCLAUDE_CFG_DIR/router" 2>/dev/null || true
+
+rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" \
+      "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-usage"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$BIN_DIR/maxclaude" "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
 fi
@@ -44,10 +61,14 @@ rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
 rm -f "$UNIT_DIR/maxagent-named@.service"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
-  rm -rf "$CFG_DIR/maxclaude"
+  # Only the throwaway per-session state; router user data survives (see above).
+  rm -f "$CFG_DIR/maxclaude"/*.panes
+  rmdir "$CFG_DIR/maxclaude" 2>/dev/null || true
 fi
 rm -rf "$CFG_DIR/maxagent"
-command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user daemon-reload 2>/dev/null || true
+fi
 
 if [ -n "$REMOVE_ZELLIJ" ]; then rm -f "$BIN_DIR/zellij"; echo "removed $BIN_DIR/zellij"; fi
 echo "maxagent uninstalled. (PATH line in your shell rc, if added, was left in place.)"

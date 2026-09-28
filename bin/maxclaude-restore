@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Recreate named maxclaude workspaces from a private tab-separated restore map.
+set -euo pipefail
+
+CFG="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+MAP="${MAXCLAUDE_RESTORE_FILE:-$CFG/restore.tsv}"
+ZJ="${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+DEFAULT_WORKDIR="${MAXCLAUDE_WORKDIR:-$HOME}"
+
+[ -x "$ZJ" ] || ZJ="$(command -v zellij 2>/dev/null || true)"
+[ -n "$ZJ" ] || { echo "maxclaude-restore: zellij not found" >&2; exit 127; }
+[ -r "$MAP" ] || {
+  echo "maxclaude-restore: restore map not found: $MAP" >&2
+  echo "Expected tab-separated fields: workspace, Claude session id, workdir, optional pane count." >&2
+  exit 2
+}
+command -v systemd-escape >/dev/null 2>&1 || {
+  echo "maxclaude-restore: systemd-escape is required" >&2
+  exit 127
+}
+
+live_sessions(){
+  "$ZJ" list-sessions 2>/dev/null \
+    | sed -E $'s/\033\\[[0-9;]*m//g' \
+    | grep -vi EXITED \
+    | awk 'NF { print $1 }'
+}
+
+transcript_path(){
+  local workdir="$1" sid="$2" project
+  project="$(printf '%s' "$workdir" | sed 's|[^A-Za-z0-9]|-|g')"
+  printf '%s/projects/%s/%s.jsonl\n' "$CLAUDE_HOME" "$project" "$sid"
+}
+
+mkdir -p "$CFG/sessions"
+chmod 0700 "$CFG" "$CFG/sessions" 2>/dev/null || true
+
+while IFS=$'\t' read -r name sid workdir panes _rest || [ -n "${name:-}" ]; do
+  case "${name:-}" in ""|'#'*) continue ;; esac
+  case "$name" in *[!A-Za-z0-9_.-]*|.|..) echo "SKIP $name: invalid workspace name" >&2; continue ;; esac
+  case "${sid:-}" in ""|*[!A-Za-z0-9-]*) echo "SKIP $name: invalid Claude session id" >&2; continue ;; esac
+  workdir="${workdir:-$DEFAULT_WORKDIR}"
+  if [ "$workdir" = '~' ]; then
+    workdir="$HOME"
+  elif [ "${workdir:0:1}" = '~' ] && [ "${workdir:1:1}" = / ]; then
+    workdir="$HOME/${workdir:2}"
+  fi
+  case "${panes:-1}" in 1|2|3|4) panes="${panes:-1}" ;; *) echo "SKIP $name: pane count must be 1, 2, 3, or 4" >&2; continue ;; esac
+  [ -d "$workdir" ] || { echo "SKIP $name: workdir does not exist" >&2; continue; }
+  transcript="$(transcript_path "$workdir" "$sid")"
+  [ -f "$transcript" ] || { echo "SKIP $name: transcript missing" >&2; continue; }
+  ( umask 077; printf 'MAXCLAUDE_WORKDIR=%s\nMAXCLAUDE_RESUME_SID=%s\n' "$workdir" "$sid" > "$CFG/sessions/${name}.env" )
+  printf '%s\n' "$panes" > "$CFG/${name}.panes"
+  if live_sessions | grep -qxF "$name"; then
+    echo "LIVE $name"
+    continue
+  fi
+  unit="maxclaude-named@$(systemd-escape "$name").service"
+  systemctl --user start "$unit"
+  echo "START $name"
+done < "$MAP"

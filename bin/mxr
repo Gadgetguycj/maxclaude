@@ -1,0 +1,887 @@
+#!/usr/bin/env bash
+# mxr: maxrouter task toolbox. Persistent claude worker conversations,
+# headless (claude -p --resume) or paned (zellij TUI driven via write-chars).
+# State lives under the maxclaude config root: orgs.json, registry.json,
+# master-log.jsonl, router/outbox/, sessions/*.env.
+set -euo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+REG="$MXR_HOME/registry.json"
+LOG="$MXR_HOME/master-log.jsonl"
+OUTBOX="$MXR_HOME/router/outbox"
+WORKER_SETTINGS="$MXR_HOME/router/worker-settings.json"
+DEFAULT_WORKDIR="${MAXROUTER_DEFAULT_WORKDIR:-$HOME}"
+SESSION_CAP="${MXR_SESSION_CAP:-30}"
+case "$SESSION_CAP" in ''|*[!0-9]*|0) echo "mxr: MXR_SESSION_CAP must be a positive integer" >&2; exit 2 ;; esac
+SESSION_WARN=$((SESSION_CAP * 9 / 10))
+[ "$SESSION_WARN" -gt 0 ] || SESSION_WARN=1
+ZJ="$HOME/.local/bin/zellij"
+if [ ! -x "$ZJ" ]; then ZJ="$(command -v zellij || echo zellij)"; fi
+
+# globals set by load_task / cmd_send
+T_NAME="" T_ORG="" T_WD="" T_SID="" T_MODE="" T_STATUS="" T_DESC=""
+MSG="" REPLY_TEXT="" ASYNC=0 TIMEOUT_S=300
+SETTINGS_ARGS=()
+
+now(){ date -u +%FT%TZ; }
+die(){ echo "mxr: $*" >&2; exit 1; }
+
+usage(){
+  cat <<'EOF'
+usage: mxr <command>
+  orgs [--json]                          list orgs
+  tasks [--json] [--org X]               list tasks
+  new <name> --org <org> --desc "..." [--workdir DIR]
+  send <name> <message...> [--async] [--timeout N]
+  open <name>                            promote task to a zellij pane
+  close <name>                           demote pane back to headless
+  archive <name>
+  trust <dir>                            pre-accept claude's trust dialog for dir
+  log [-n N] [pattern]                   tail/grep master log
+  status [--json]                        tasks + sessions + router/web state
+  peek <name> [-n N] [--raw]             dump a worker pane's current screen (no attach)
+       [--session S]                     ...or any zellij session by name
+  watch <name> [-i S] [-n N]             live-refresh a worker's pane/transcript (ctrl-c)
+  health [--json] [--stall S] [--org X]  per-task liveness: working/idle/stalled/dead
+  ps [--json]                            maxclaude/worker process census
+  notify <name>                          manually push a task's reply to the router pane
+EOF
+}
+
+ensure_home(){
+  mkdir -p "$MXR_HOME/sessions" "$OUTBOX"
+  if [ ! -f "$REG" ]; then printf '{"tasks":{}}\n' > "$REG"; fi
+  if [ ! -f "$LOG" ]; then : > "$LOG"; fi
+}
+
+# zellij must never see the caller's ZELLIJ_* env: from inside a session it
+# would silently graft a tab onto that session instead (spike-proven)
+zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
+
+live_sessions(){
+  zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -vi 'EXITED' | awk 'NF{print $1}' || true
+}
+
+session_live(){ live_sessions | grep -qxF "task-$1"; }
+
+resolve_org(){ # $1 = name-or-alias (case-insensitive) -> "Name<TAB>workdir"
+  if [ ! -f "$MXR_HOME/orgs.json" ]; then return 1; fi
+  local row
+  row="$(jq -r --arg a "$1" '
+    .orgs[]
+    | select((.name|ascii_downcase) == ($a|ascii_downcase)
+             or ([.aliases[]?|ascii_downcase] | index($a|ascii_downcase)))
+    | [.name, .workdir] | @tsv' "$MXR_HOME/orgs.json" | head -n1)"
+  if [ -z "$row" ]; then return 1; fi
+  printf '%s\n' "$row"
+}
+
+load_task(){
+  local n="$1"
+  if ! jq -e --arg n "$n" '.tasks[$n]' "$REG" >/dev/null 2>&1; then
+    die "no such task: $n (see: mxr tasks)"
+  fi
+  T_NAME="$n"
+  T_ORG="$(jq -r --arg n "$n" '.tasks[$n].org // ""' "$REG")"
+  T_WD="$(jq -r --arg n "$n" '.tasks[$n].workdir // empty' "$REG")"
+  T_WD="${T_WD:-$DEFAULT_WORKDIR}"
+  T_SID="$(jq -r --arg n "$n" '.tasks[$n].sid // ""' "$REG")"
+  T_MODE="$(jq -r --arg n "$n" '.tasks[$n].mode // "headless"' "$REG")"
+  T_STATUS="$(jq -r --arg n "$n" '.tasks[$n].status // "active"' "$REG")"
+  T_DESC="$(jq -r --arg n "$n" '.tasks[$n].desc // ""' "$REG")"
+}
+
+reg_set_field(){ # name key value
+  local tmp; tmp="$(mktemp)"
+  jq --arg n "$1" --arg k "$2" --arg v "$3" '.tasks[$n][$k] = $v' "$REG" > "$tmp"
+  mv "$tmp" "$REG"
+}
+
+log_line(){ # task org dir text (text capped at 4000 chars)
+  jq -cn --arg ts "$(now)" --arg task "$1" --arg org "$2" --arg dir "$3" --arg text "$4" \
+    '{ts:$ts, task:$task, org:$org, dir:$dir, text:($text|.[0:4000])}' >> "$LOG"
+}
+
+transcript_path(){ # workdir sid -> resume is cwd-scoped; slug mirrors claude's
+  printf '%s/.claude/projects/%s/%s.jsonl' \
+    "$HOME" "$(printf '%s' "$1" | sed 's|[^A-Za-z0-9]|-|g')" "$2"
+}
+
+pretrust_dir(){ # $1 = workdir: pre-accept claude's first-run "do you trust this
+  # folder?" dialog, which no headless pane driver can answer. Touches ONLY
+  # .projects["<dir>"].hasTrustDialogAccepted; atomic write; one-time backup.
+  local dir="$1" cj="$HOME/.claude.json" tmp
+  if [ -z "$dir" ]; then return 0; fi
+  if [ ! -f "$cj" ]; then printf '{"projects":{}}\n' > "$cj"; fi
+  if jq -e --arg d "$dir" '.projects[$d].hasTrustDialogAccepted == true' "$cj" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ ! -f "$cj.bak-maxrouter" ]; then cp -p "$cj" "$cj.bak-maxrouter"; fi
+  tmp="$(mktemp "$cj.XXXXXX")"
+  if jq --arg d "$dir" \
+      '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' \
+      "$cj" > "$tmp"; then
+    mv "$tmp" "$cj"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+preamble(){
+  printf 'You are a persistent worker conversation managed by maxrouter. Task: %s (org %s). The user talks to you through a thin router; front-load your answers, be complete but concise, and never ask the router to do work. CRITICAL: you run in a NON-INTERACTIVE pane: NEVER open an interactive menu, selection list, or AskUserQuestion / permission / confirmation prompt. A blocking TUI menu freezes you invisibly and strands the operator. When you need an operator decision, instead WRITE the question followed by its numbered options as plain text in your reply and STOP; the router relays it and sends the answer back as an ordinary message (the operator may answer with a number like "1" or with free text).' \
+    "$T_DESC" "$T_ORG"
+}
+
+print_reply(){
+  local r="$1" n=${#1}
+  if [ "$n" -gt 3000 ]; then
+    printf '%s\n' "${r:0:1500}"
+    printf '…[%d chars elided; attach with: maxclaude attach task-%s]\n' "$((n-2500))" "$T_NAME"
+    printf '%s\n' "${r: -1000}"
+  else
+    printf '%s\n' "$r"
+  fi
+}
+
+# Runaway safety net ONLY: NOT the reply-wait window. A headless turn is never
+# killed at the old 300s; wait and capture are decoupled (see run_headless_turn).
+HEADLESS_HARDCAP="${MXR_HEADLESS_HARDCAP:-6h}"
+claude_p(){ # "$@" = --session-id <sid> | --resume <sid>
+  # IS_SANDBOX=1: claude refuses --dangerously-skip-permissions as root without it
+  ( cd "$T_WD" && timeout "$HEADLESS_HARDCAP" \
+      env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
+          -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH -u CLAUDE_EFFORT \
+          IS_SANDBOX=1 \
+      claude -p --dangerously-skip-permissions "$@" "${SETTINGS_ARGS[@]}" \
+        --output-format json --append-system-prompt "$(preamble)" "$MSG" )
+}
+
+# run_headless_turn: runs the turn to completion: HOWEVER LONG: in a process
+# detached via setsid (see cmd_send), so it survives the router dying and is
+# never killed at 300s. On turn-end it ALWAYS writes the outbox (backup to the
+# Stop hook), so a long turn can never be orphaned (INCIDENT 2026-08-02).
+run_headless_turn(){
+  local tp errf out rc new_sid mode_args=()
+  tp="$(transcript_path "$T_WD" "$T_SID")"
+  if [ -f "$tp" ]; then mode_args=(--resume "$T_SID"); else mode_args=(--session-id "$T_SID"); fi
+  SETTINGS_ARGS=()
+  if [ -f "$WORKER_SETTINGS" ]; then SETTINGS_ARGS=(--settings "$WORKER_SETTINGS"); fi
+  errf="$(mktemp)"; rc=0
+  out="$(claude_p "${mode_args[@]}" 2>"$errf")" || rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -f "$tp" ] && grep -qi 'already in use' "$errf"; then
+    T_SID="$(uuidgen)"; reg_set_field "$T_NAME" sid "$T_SID"; rc=0
+    out="$(claude_p --session-id "$T_SID" 2>"$errf")" || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    REPLY_TEXT="$(jq -r '.result // ""' <<<"$out")"
+    new_sid="$(jq -r '.session_id // empty' <<<"$out")"
+    if [ -n "$new_sid" ] && [ "$new_sid" != "$T_SID" ]; then
+      reg_set_field "$T_NAME" sid "$new_sid"; T_SID="$new_sid"
+    fi
+  elif [ "$rc" -eq 124 ]; then
+    REPLY_TEXT="[worker turn hit the ${HEADLESS_HARDCAP} hard cap without finishing: likely runaway. Inspect: mxr watch $T_NAME]"
+    log_line "$T_NAME" "$T_ORG" router "headless turn hit hardcap ${HEADLESS_HARDCAP} (rc=124)"
+  else
+    REPLY_TEXT="[worker turn failed rc=$rc: $(head -c 200 "$errf")]"
+    log_line "$T_NAME" "$T_ORG" router "headless turn failed rc=$rc"
+  fi
+  reg_set_field "$T_NAME" last "$(now)"
+  log_line "$T_NAME" "$T_ORG" "task->user" "$REPLY_TEXT"
+  write_outbox                 # ALWAYS capture: never leave an orphaned turn
+  inflight_unmark "$T_NAME"
+  rm -f "$errf"
+  return 0
+}
+
+write_outbox(){
+  jq -n --arg ts "$(now)" --arg sid "$T_SID" --arg text "$REPLY_TEXT" \
+    '{ts:$ts, sid:$sid, text:$text}' > "$OUTBOX/$T_SID.json"
+}
+
+# A .notify/<sid> marker flags a reply the router still needs PUSHED (async, or a
+# sync send that gave up waiting). mxr-notifyd pokes only for marked replies, so
+# a sync send that got its reply inline never triggers a spurious push.
+notify_mark(){   mkdir -p "$OUTBOX/.notify" 2>/dev/null || true; : > "$OUTBOX/.notify/$1" 2>/dev/null || true; }
+notify_unmark(){ rm -f "$OUTBOX/.notify/$1" 2>/dev/null || true; }
+
+# A .inflight/<task> marker records an in-flight headless turn (JSON: task, org,
+# sid, workdir, start epoch, transcript baseline). mxr-heartbeatd reads it to
+# emit still-working heartbeats / >30m alerts, and mxr health uses it to tell a
+# genuine ORPHAN (turn ended, no reply) from a resting IDLE worker.
+inflight_mark(){ # $1=task $2=sid $3=start_epoch
+  mkdir -p "$OUTBOX/.inflight" 2>/dev/null || true
+  local tp lines=0 bytes=0
+  tp="$(transcript_path "$T_WD" "$2")"
+  if [ -f "$tp" ]; then lines="$(wc -l <"$tp" 2>/dev/null || echo 0)"; bytes="$(stat -c %s "$tp" 2>/dev/null || echo 0)"; fi
+  jq -cn --arg task "$1" --arg org "$T_ORG" --arg sid "$2" --arg wd "$T_WD" \
+     --argjson start "$3" --argjson lines0 "${lines:-0}" --argjson bytes0 "${bytes:-0}" \
+     '{task:$task,org:$org,sid:$sid,workdir:$wd,start:$start,lines0:$lines0,bytes0:$bytes0}' \
+     > "$OUTBOX/.inflight/$1" 2>/dev/null || true
+}
+inflight_unmark(){ rm -f "$OUTBOX/.inflight/$1" "$OUTBOX/.inflight/$1.beat" 2>/dev/null || true; }
+
+# wait_outbox: block up to $2 secs for THIS turn's fresh reply to hit the outbox
+# (re-reading the sid each poll so a sid-fork mid-turn is followed). Sets
+# REPLY_TEXT and returns 0 on success; 1 on timeout (turn keeps running).
+wait_outbox(){ # $1 = dispatch epoch, $2 = seconds
+  local disp="$1" secs="$2" waited=0 sid f mt
+  while [ "$waited" -lt "$secs" ]; do
+    sid="$(jq -r --arg n "$T_NAME" '.tasks[$n].sid // ""' "$REG" 2>/dev/null)"; [ -n "$sid" ] || sid="$T_SID"
+    f="$OUTBOX/$sid.json"
+    if [ -f "$f" ]; then
+      mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+      if [ "$mt" -ge "$disp" ]; then REPLY_TEXT="$(jq -r '.text // ""' "$f" 2>/dev/null)"; T_SID="$sid"; return 0; fi
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  return 1
+}
+
+send_paned(){
+  local sess="task-$T_NAME" outfile="$OUTBOX/$T_SID.json"
+  local before cur waited
+  before="$(stat -c %Y "$outfile" 2>/dev/null || echo 0)"
+  # DELIVERY: bracketed paste keeps arbitrary text (newlines, quotes) from
+  # mis-firing. A failure HERE is a real delivery error (exit 1); a reply
+  # timeout AFTER successful delivery is NOT an error (INCIDENT 2026-08-02).
+  if ! zj --session "$sess" action write-chars -p terminal_0 $'\e[200~'"$MSG"$'\e[201~' 2>/dev/null \
+     || ! zj --session "$sess" action write -p terminal_0 13 2>/dev/null; then
+    echo "mxr: DELIVERY FAILED to pane task-$T_NAME (session gone mid-send?)" >&2
+    log_line "$T_NAME" "$T_ORG" router "paned delivery FAILED"
+    return 1
+  fi
+  if [ "$ASYNC" = 1 ]; then
+    notify_mark "$T_SID"   # so mxr-notifyd pokes the router when the Stop hook replies
+    echo "queued to pane task-$T_NAME (reply lands in outbox via Stop hook; router pushed on arrival)"
+    return 0
+  fi
+  cur="$before"; waited=0
+  while [ "$waited" -lt "$TIMEOUT_S" ]; do
+    sleep 1
+    waited=$((waited + 1))
+    cur="$(stat -c %Y "$outfile" 2>/dev/null || echo 0)"
+    if [ "$cur" != "$before" ]; then break; fi
+  done
+  if [ "$cur" = "$before" ]; then
+    # DELIVERED but no reply yet: the worker is still mid-turn. This is NOT an
+    # error: arm the push so the reply lands via the outbox, report, and exit 0.
+    notify_mark "$T_SID"
+    echo "delivered to task-$T_NAME; worker still mid-turn: reply pending, will be PUSHED to the router via the outbox when the turn ends (no 300s error). Live view: mxr watch $T_NAME"
+    log_line "$T_NAME" "$T_ORG" router "paned send delivered; reply pending after ${TIMEOUT_S}s wait (push armed)"
+    return 0
+  fi
+  REPLY_TEXT="$(jq -r '.text // ""' "$outfile")"
+  reg_set_field "$T_NAME" last "$(now)"
+  log_line "$T_NAME" "$T_ORG" "task->user" "$REPLY_TEXT"
+  print_reply "$REPLY_TEXT"
+}
+
+# ---- worker inspection / health -------------------------------------------
+# The registry "active" flag only says a conversation exists; it says nothing
+# about whether the worker is running RIGHT NOW. These helpers derive live
+# truth from three sources: the zellij session, the bound claude process
+# (matched by the task's unique sid), and the transcript file's mtime.
+
+human_age(){ # seconds -> "12s" / "5m" / "2h3m"; "-" for negative (missing)
+  local s="${1:-0}"
+  if ! [[ "$s" =~ ^-?[0-9]+$ ]] || [ "$s" -lt 0 ]; then echo "-"; return; fi
+  if   [ "$s" -lt 60 ];   then echo "${s}s"
+  elif [ "$s" -lt 3600 ]; then echo "$((s/60))m"
+  else echo "$((s/3600))h$(((s%3600)/60))m"; fi
+}
+
+sid_pids(){ # $1 = sid -> "pid etimes rss_kb" lines for the real claude proc(s)
+  # comm==claude filters out the timeout/env/bash wrappers that also carry the
+  # sid in their argv; index($0,s) binds the proc to THIS task.
+  ps -eo pid=,comm=,etimes=,rss=,args= 2>/dev/null \
+    | awk -v s="$1" '$2=="claude" && index($0,s){print $1, $3, $4}'
+}
+
+srv_pid(){ # $1 = session -> pid of its zellij --server, or empty
+  ps -eo pid=,args= 2>/dev/null \
+    | awk -v n="$1" '/zellij --server/ && $0 ~ ("/" n "$"){print $1; exit}'
+}
+
+transcript_age(){ # workdir sid -> seconds since last write, or -1 if no transcript
+  local tp; tp="$(transcript_path "$1" "$2")"
+  if [ ! -f "$tp" ]; then echo -1; return; fi
+  echo $(( $(date +%s) - $(stat -c %Y "$tp" 2>/dev/null || echo 0) ))
+}
+
+# BLOCK SIGNATURE: keep textually identical to bin/mxr-blockd. A modal TUI
+# (AskUserQuestion menu / permission prompt / folder-trust dialog) waiting on a
+# keypress. A working pane shows a spinner/"esc to interrupt"; an idle pane shows
+# an empty "❯ " prompt; NEITHER shows a numbered selection cursor "❯ 1." or a
+# menu/permission/trust footer.
+BLOCK_SIG='❯ [0-9]+\.|Enter to select|to navigate|to cancel|Do you trust the files|Do you want to proceed|Yes, proceed|No, exit|allow all edits|Do you want to make this edit|Press enter to continue'
+
+# The normal input box ("bypass permissions on (shift+tab to cycle)") and the
+# working spinner ("esc to interrupt") are the affordances a live modal REPLACES.
+# So a blocked pane shows the BLOCK_SIG and NEITHER of these; a pane merely
+# showing menu-like text in scrollback still shows one of them.
+LIVE_AFFORDANCE='bypass permissions on|shift\+tab to cycle|esc to interrupt'
+
+pane_state(){ # $1 = session -> blocked|working|idle|unknown (from the live TUI screen)
+  # Claude's spinner verbs are randomized ("Roosting", "Wrangling", "Herding"...)
+  # and extended-thinking frames may not print "esc to interrupt", so we can't
+  # keyword-match "working" reliably. Instead: motion. A pane mid-turn animates
+  # its spinner and token/second counters, so two dumps ~0.5s apart DIFFER; a
+  # pane parked at the `❯` prompt is byte-for-byte static.
+  local a b
+  a="$(zj --session "$1" action dump-screen -p terminal_0 2>/dev/null \
+       | sed -E 's/\x1b\[[0-9;]*m//g')" || { echo unknown; return; }
+  if [ -z "$a" ]; then echo unknown; return; fi
+  if grep -qiE 'esc to interrupt' <<<"$a"; then echo working; return; fi
+  sleep 0.5
+  b="$(zj --session "$1" action dump-screen -p terminal_0 2>/dev/null \
+       | sed -E 's/\x1b\[[0-9;]*m//g')" || { echo unknown; return; }
+  if [ "$a" != "$b" ]; then echo working; return; fi
+  # static now. A real modal shows the BLOCK_SIG with NO normal input/spinner
+  # affordance (the menu replaced it): this rejects menu text in scrollback.
+  if grep -qE "$BLOCK_SIG" <<<"$a" && ! grep -qE "$LIVE_AFFORDANCE" <<<"$a"; then
+    echo blocked; return
+  fi
+  if grep -qE 'bypass permissions on|shift\+tab to cycle' <<<"$a"; then echo idle; return; fi
+  echo unknown   # frozen screen that is NOT the clean idle prompt -> suspicious
+}
+
+transcript_text(){ # $1 = transcript path -> rough plaintext of user/assistant turns
+  jq -r 'select(.type=="user" or .type=="assistant")
+         | (.message.role // .type) as $r
+         | (.message.content // [])
+         | (if type=="string" then .
+            else (map(select(.type=="text").text) | join("\n")) end) as $t
+         | select(($t|length) > 0) | "[" + $r + "] " + $t' "$1" 2>/dev/null
+}
+
+# task_state: given a task already loaded via load_task, sets G_STATE, G_PID,
+# G_AGE (seconds, -1=none), G_NOTE. $1 = stall threshold in seconds.
+task_state(){
+  local stall="$1" sess="task-$T_NAME" live=0 pids pid age pstate
+  session_live "$T_NAME" && live=1
+  pids="$(sid_pids "$T_SID")"; pid="$(awk 'NR==1{print $1}' <<<"$pids")"
+  age="$(transcript_age "$T_WD" "$T_SID")"
+  # a transcript touched within this window means the worker is actively
+  # producing right now, even if the spinner was off-screen at dump time.
+  local active_window=20
+  G_PID="${pid:--}"; G_AGE="$age"; G_NOTE=""
+  if [ "$T_MODE" = paned ]; then
+    if [ "$live" = 0 ]; then
+      G_STATE=DEAD; G_NOTE="registry mode=paned but zellij session gone"; return
+    fi
+    pstate="$(pane_state "$sess")"
+    case "$pstate" in
+      blocked) # modal awaiting input: the worst case, surfaces via mxr-blockd push
+        G_STATE=BLOCKED; G_NOTE="awaiting operator input (interactive menu/permission): relay it" ;;
+      working) # screen is animating -> genuinely mid-turn; animation proves life
+        G_STATE=WORKING
+        if [ "$age" -ge 0 ] && [ "$age" -gt "$stall" ]; then
+          G_NOTE="long turn: transcript idle $(human_age "$age")"
+        fi ;;
+      idle)
+        # spinner off-screen but transcript still moving -> between tool calls
+        if [ "$age" -ge 0 ] && [ "$age" -le "$active_window" ]; then G_STATE=WORKING
+        elif [ -z "$pid" ]; then G_STATE=DEAD; G_NOTE="session up but no claude process"
+        else G_STATE=IDLE; fi ;;
+      *) # frozen screen that is NOT the clean idle prompt: dialog/wedge suspected
+        if [ -z "$pid" ]; then G_STATE=DEAD; G_NOTE="session up but no claude process"
+        elif [ "$age" -ge 0 ] && [ "$age" -le "$active_window" ]; then G_STATE=WORKING
+        elif [ "$age" -lt 0 ] || [ "$age" -gt "$stall" ]; then
+          G_STATE=STALLED; G_NOTE="pane frozen off-prompt, transcript idle $(human_age "$age") (awaiting a dialog?)"
+        else G_STATE=IDLE; G_NOTE="screen unreadable; claude pid live"; fi ;;
+    esac
+  else # headless: a turn runs as a detached `claude -p --resume <sid>` process.
+    # WORKING = a bound proc OR a transcript that grew very recently (covers the
+    # window before the proc is matched). ORPHAN = a turn was dispatched
+    # (.inflight marker) but has no proc, a stale transcript, AND no fresh reply
+    # in the outbox: the exact silent-orphan failure from INCIDENT 2026-08-02.
+    local inflight=0 start=0 obf=0 growing=0 omt
+    if [ -f "$OUTBOX/.inflight/$T_NAME" ]; then
+      inflight=1; start="$(jq -r '.start // 0' "$OUTBOX/.inflight/$T_NAME" 2>/dev/null || echo 0)"
+    fi
+    [ "$age" -ge 0 ] && [ "$age" -le 90 ] && growing=1
+    if [ -f "$OUTBOX/$T_SID.json" ]; then
+      omt="$(stat -c %Y "$OUTBOX/$T_SID.json" 2>/dev/null || echo 0)"
+      [ "$omt" -ge "$start" ] && obf=1
+    fi
+    if [ -n "$pid" ] || [ "$growing" = 1 ]; then
+      if [ -n "$pid" ] && [ "$growing" = 0 ] && [ "$age" -ge 0 ] && [ "$age" -gt "$stall" ]; then
+        G_STATE=STALLED; G_NOTE="headless turn in-flight (pid $pid) but transcript idle $(human_age "$age")"
+      else
+        G_STATE=WORKING; G_NOTE="headless turn in-flight${pid:+ (pid $pid)}"
+      fi
+    elif [ "$inflight" = 1 ] && [ "$obf" = 0 ]; then
+      G_STATE=ORPHAN; G_NOTE="turn ended with NO reply captured: ORPHANED; inspect: mxr watch $T_NAME"
+    elif [ "$age" -lt 0 ]; then
+      G_STATE=NEW; G_NOTE="no transcript yet"
+    else
+      G_STATE=IDLE  # resting between sends; the conversation persists on disk
+    fi
+  fi
+}
+
+cmd_peek(){
+  local name="" n=40 raw=0 sess=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) shift; n="${1:?-n needs N}" ;;
+      --raw) raw=1 ;;
+      --session) shift; sess="${1:?--session needs a name}" ;;
+      -*) die "peek: unknown flag: $1" ;;
+      *) name="$1" ;;
+    esac; shift
+  done
+  if [ -z "$sess" ]; then
+    [ -n "$name" ] || die "usage: mxr peek <name> [-n N] [--raw] | mxr peek --session <zellij-session>"
+    load_task "$name"
+    sess="task-$name"
+    if [ "$T_MODE" != paned ] || ! session_live "$name"; then
+      # headless (or pane down): no screen: tail the session transcript by sid,
+      # so "what is X doing right now" works with no pane (INCIDENT 2026-08-02).
+      local tp; tp="$(transcript_path "$T_WD" "$T_SID")"
+      [ -f "$tp" ] || die "task '$name' has no transcript yet (never sent)"
+      task_state 300
+      printf '== %s [headless] state=%s  transcript age=%s : last %s lines of the live transcript ==\n' \
+        "$name" "$G_STATE" "$(human_age "$G_AGE")" "$n"
+      transcript_text "$tp" | tail -n "$n"
+      return 0
+    fi
+  fi
+  local scr
+  scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null)" \
+    || die "could not dump screen for session '$sess' (running? try: mxr status)"
+  if [ "$raw" = 1 ]; then printf '%s\n' "$scr" | tail -n "$n"
+  else printf '%s\n' "$scr" | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n "$n"; fi
+}
+
+cmd_watch(){
+  local name="" i=2 n=40
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) shift; i="${1:?-i needs secs}" ;;
+      -n) shift; n="${1:?-n needs N}" ;;
+      -*) die "watch: unknown flag: $1" ;;
+      *) name="$1" ;;
+    esac; shift
+  done
+  [ -n "$name" ] || die "usage: mxr watch <name> [-i SECS] [-n N]"
+  load_task "$name"
+  local sess="task-$name" tp
+  tp="$(transcript_path "$T_WD" "$T_SID")"
+  trap 'echo; exit 0' INT
+  while :; do
+    clear 2>/dev/null || true
+    task_state 300
+    printf '== mxr watch %s  mode=%s  state=%s  age=%s  pid=%s  %s ==\n' \
+      "$name" "$T_MODE" "$G_STATE" "$(human_age "$G_AGE")" "$G_PID" "$(now)"
+    printf -- '-- ctrl-c to stop, refresh %ss --\n' "$i"
+    if [ "$T_MODE" = paned ] && session_live "$name"; then
+      zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n "$n"
+    elif [ -f "$tp" ]; then
+      transcript_text "$tp" | tail -n "$n"
+    else
+      echo "(no pane and no transcript yet: task never sent)"
+    fi
+    sleep "$i"
+  done
+}
+
+cmd_health(){
+  local as_json=0 stall=300 org=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1 ;;
+      --stall) shift; stall="${1:?--stall needs SECS}" ;;
+      --org) shift; org="${1:?--org needs a value}" ;;
+      *) die "health: unknown arg: $1" ;;
+    esac; shift
+  done
+  if [ -n "$org" ]; then local row; if row="$(resolve_org "$org")"; then org="${row%%$'\t'*}"; fi; fi
+  local names live_all total tasks_live
+  names="$(jq -r --arg o "$org" '
+    .tasks | to_entries[]
+    | select(.value.status == "active") | select($o == "" or .value.org == $o)
+    | .key' "$REG")"
+  live_all="$(live_sessions)"
+  total="$(grep -c . <<<"$live_all" || true)"; [ -n "$total" ] || total=0
+  tasks_live="$(grep -c '^task-' <<<"$live_all" || true)"; [ -n "$tasks_live" ] || tasks_live=0
+  if [ "$as_json" = 1 ]; then
+    local objs="" name
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      load_task "$name"; task_state "$stall"
+      objs+="$(jq -cn --arg t "$name" --arg org "$T_ORG" --arg mode "$T_MODE" \
+        --arg state "$G_STATE" --arg pid "$G_PID" --argjson age "${G_AGE:--1}" \
+        --arg note "$G_NOTE" --arg desc "$T_DESC" \
+        '{task:$t, org:$org, mode:$mode, state:$state, pid:$pid,
+          transcript_age_s:$age, note:$note, desc:$desc}')"$'\n'
+    done <<<"$names"
+    jq -sn --argjson total "$total" --argjson tl "$tasks_live" --argjson cap "$SESSION_CAP" \
+      --argjson warn "$SESSION_WARN" --slurpfile rows <(printf '%s' "$objs") '
+      {sessions_live: $total, task_sessions_live: $tl, session_cap: $cap,
+       near_cap: ($total >= $warn), tasks: ($rows)}'
+    return 0
+  fi
+  printf '%-9s %-22s %-13s %-8s %-8s %-7s %s\n' STATE TASK ORG MODE PID AGE NOTE
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    load_task "$name"; task_state "$stall"
+    printf '%-9s %-22s %-13s %-8s %-8s %-7s %s\n' \
+      "$G_STATE" "$name" "$T_ORG" "$T_MODE" "$G_PID" "$(human_age "$G_AGE")" "$G_NOTE"
+  done <<<"$names"
+  echo
+  printf 'sessions: %s live (%s task panes) / %s cap' "$total" "$tasks_live" "$SESSION_CAP"
+  if [ "$total" -ge "$SESSION_WARN" ]; then printf '  APPROACHING CAP, close idle panes'; fi
+  echo
+}
+
+cmd_ps(){
+  local as_json=0
+  if [ "${1:-}" = "--json" ]; then as_json=1; fi
+  # Every active task -> its bound claude proc facts + zellij server (if paned).
+  local names name rows="" pids pid et rss srv kind
+  names="$(jq -r '.tasks | to_entries[] | select(.value.status=="active") | .key' "$REG")"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    load_task "$name"
+    pids="$(sid_pids "$T_SID")"
+    pid="$(awk 'NR==1{print $1}' <<<"$pids")"
+    et="$(awk 'NR==1{print $2}' <<<"$pids")"; rss="$(awk 'NR==1{print $3}' <<<"$pids")"
+    srv=""; kind=none
+    if [ "$T_MODE" = paned ]; then srv="$(srv_pid "task-$name")"; fi
+    if [ -n "$pid" ]; then [ "$T_MODE" = paned ] && kind=pane || kind=inflight; fi
+    rows+="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$name" "$T_MODE" "$kind" "${pid:--}" "${et:--}" \
+      "$([ -n "$rss" ] && echo "$((rss/1024))M" || echo -)" "${srv:--}")"$'\n'
+  done <<<"$names"
+  if [ "$as_json" = 1 ]; then
+    printf '%s' "$rows" | jq -R -s 'split("\n") | map(select(length>0) | split("\t"))
+      | map({task:.[0], mode:.[1], kind:.[2], pid:.[3], etime_s:.[4], rss:.[5], zellij_srv:.[6]})'
+  else
+    { printf 'TASK\tMODE\tKIND\tPID\tETIME\tRSS\tSRV\n'; printf '%s' "$rows"; } \
+      | awk -F'\t' '{printf "%-22s %-9s %-9s %-8s %-8s %-6s %s\n",$1,$2,$3,$4,$5,$6,$7}'
+  fi
+}
+
+cmd_notify(){ # manual re-poke the router about a task's latest reply
+  local name="${1:?usage: mxr notify <name>}"
+  load_task "$name"
+  # REFUSE to push a reply that does not exist (INCIDENT 2026-08-02: a false
+  # [worker-reply] fired for a reply that was never written).
+  if [ ! -f "$OUTBOX/$T_SID.json" ]; then
+    task_state 300
+    echo "mxr: no reply yet for '$name': worker is mid-turn (state=$G_STATE, transcript age $(human_age "$G_AGE")). Refusing to push a nonexistent reply. Live view: mxr watch $name" >&2
+    return 0
+  fi
+  local nb
+  nb="$(dirname "$0")/mxr-notify"
+  [ -x "$nb" ] || nb="$HOME/.local/bin/mxr-notify"
+  "$nb" reply "$T_SID" || true
+  echo "poked router about $name (sid $T_SID)"
+}
+
+cmd_run_turn(){ # internal: __run-turn <name> <disp_epoch> <message...>
+  local name="${1:?}" disp="${2:-0}"; shift 2 || true
+  MSG="$*"
+  load_task "$name"
+  : "$disp"   # inflight marker was written by the parent; we clear it on finish
+  run_headless_turn
+}
+
+cmd_orgs(){
+  local as_json=0
+  if [ "${1:-}" = "--json" ]; then as_json=1; fi
+  if [ ! -f "$MXR_HOME/orgs.json" ]; then die "no orgs.json under $MXR_HOME"; fi
+  if [ "$as_json" = 1 ]; then
+    jq . "$MXR_HOME/orgs.json"
+  else
+    jq -r '.orgs[] | [.name, (.aliases|join(",")), .workdir, (.color // "")] | @tsv' \
+        "$MXR_HOME/orgs.json" \
+      | awk -F'\t' '{printf "%-14s aliases=%-18s workdir=%-16s %s\n", $1, $2, $3, $4}'
+  fi
+}
+
+cmd_tasks(){
+  local as_json=0 org=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1 ;;
+      --org) shift; org="${1:?mxr tasks: --org needs a value}" ;;
+      *) die "tasks: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  if [ -n "$org" ]; then
+    local row
+    if row="$(resolve_org "$org")"; then org="${row%%$'\t'*}"; fi
+  fi
+  if [ "$as_json" = 1 ]; then
+    jq --arg o "$org" '{tasks: (.tasks | with_entries(select($o == "" or .value.org == $o)))}' "$REG"
+  else
+    jq -r --arg o "$org" '
+      .tasks | to_entries[] | select($o == "" or .value.org == $o)
+      | [.key, .value.org, .value.mode, .value.status, (.value.last // ""), (.value.desc // "")]
+      | @tsv' "$REG" \
+    | awk -F'\t' '
+      BEGIN{printf "%-22s %-14s %-9s %-9s %-21s %s\n","TASK","ORG","MODE","STATUS","LAST","DESC"}
+      {printf "%-22s %-14s %-9s %-9s %-21s %s\n",$1,$2,$3,$4,$5,$6}'
+  fi
+}
+
+cmd_new(){
+  local name="${1:?usage: mxr new <name> --org <org> --desc \"...\" [--workdir DIR]}"; shift
+  if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]]; then
+    die "bad task name '$name' (want ^[a-z0-9][a-z0-9-]{0,40}\$)"
+  fi
+  local org="" desc="" wd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org) shift; org="${1:?--org needs a value}" ;;
+      --desc) shift; desc="${1:?--desc needs a value}" ;;
+      --workdir) shift; wd="${1:?--workdir needs a value}" ;;
+      *) die "new: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  if [ -z "$org" ]; then die "new: --org is required"; fi
+  if [ -z "$desc" ]; then die "new: --desc is required"; fi
+  local row oname owd
+  row="$(resolve_org "$org")" || die "unknown org: $org (see: mxr orgs)"
+  oname="${row%%$'\t'*}"; owd="${row#*$'\t'}"
+  if [ -z "$wd" ]; then wd="$owd"; fi
+  if [ "$wd" = '~' ]; then
+    wd="$HOME"
+  elif [ "${wd:0:1}" = '~' ] && [ "${wd:1:1}" = / ]; then
+    wd="$HOME/${wd:2}"
+  fi
+  [ -d "$wd" ] || die "workdir does not exist: $wd"
+  if jq -e --arg n "$name" '.tasks[$n]' "$REG" >/dev/null 2>&1; then
+    die "task already exists: $name"
+  fi
+  local sid ts tmp
+  sid="$(uuidgen)"; ts="$(now)"; tmp="$(mktemp)"
+  jq --arg n "$name" --arg o "$oname" --arg d "$desc" --arg s "$sid" --arg w "$wd" --arg t "$ts" \
+    '.tasks[$n] = {org:$o, desc:$d, sid:$s, workdir:$w, mode:"headless", status:"active", created:$t, last:$t}' \
+    "$REG" > "$tmp"
+  mv "$tmp" "$REG"
+  log_line "$name" "$oname" router "task created: $desc"
+  echo "created task $name (org $oname, sid $sid, workdir $wd, headless)"
+}
+
+cmd_send(){
+  local name="${1:?usage: mxr send <name> <message...> [--async] [--timeout N]}"; shift
+  local words=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --async) ASYNC=1 ;;
+      --timeout) shift; TIMEOUT_S="${1:?--timeout needs N}" ;;
+      *) words+=("$1") ;;
+    esac
+    shift
+  done
+  if [ "${#words[@]}" -eq 0 ]; then die "send: empty message"; fi
+  MSG="${words[*]}"
+  load_task "$name"
+  if [ "$T_STATUS" != "active" ]; then die "task $name is archived"; fi
+  log_line "$T_NAME" "$T_ORG" "user->task" "$MSG"
+  if [ "$T_MODE" = "paned" ] && ! session_live "$T_NAME"; then
+    echo "mxr: pane session task-$T_NAME is not running; demoting to headless" >&2
+    reg_set_field "$T_NAME" mode headless
+    T_MODE=headless
+  fi
+  if [ "$T_MODE" = "paned" ]; then
+    send_paned
+  else
+    # HEADLESS: reply capture is DECOUPLED from this call. The turn runs
+    # detached via setsid (survives the router/mxr process dying) and ALWAYS
+    # lands its reply in the outbox on turn-end. The foreground only WAITS,
+    # never kills (INCIDENT 2026-08-02: the old `timeout 300 claude` killed the
+    # turn / stopped tracking and orphaned the reply).
+    local disp_ts; disp_ts="$(date +%s)"
+    mkdir -p "$MXR_HOME/router/turns" 2>/dev/null || true
+    inflight_mark "$T_NAME" "$T_SID" "$disp_ts"
+    setsid "$0" __run-turn "$T_NAME" "$disp_ts" "$MSG" </dev/null \
+      >>"$MXR_HOME/router/turns/$T_NAME.log" 2>&1 &
+    disown
+    if [ "$ASYNC" = 1 ]; then
+      notify_mark "$T_SID"
+      echo "dispatched async to $name (sid $T_SID); turn runs detached: reply captured on turn-end and PUSHED to the router (no 300s kill)"
+    elif wait_outbox "$disp_ts" "$TIMEOUT_S"; then
+      print_reply "$REPLY_TEXT"        # arrived within the wait window: inline, no push
+    else
+      # stop WAITING, keep TRACKING: arm the push for whenever it lands + report
+      notify_mark "$T_SID"
+      local f="$OUTBOX/$T_SID.json"
+      if [ -f "$f" ] && [ "$(stat -c %Y "$f" 2>/dev/null || echo 0)" -ge "$disp_ts" ]; then
+        notify_unmark "$T_SID"; REPLY_TEXT="$(jq -r '.text // ""' "$f")"; print_reply "$REPLY_TEXT"
+      else
+        task_state 300
+        echo "delivered to $name; worker still mid-turn (state=$G_STATE, transcript age $(human_age "$G_AGE")): turn is STILL RUNNING, not killed. Reply will be PUSHED to the router when it ends. Live view: mxr watch $name"
+      fi
+    fi
+  fi
+}
+
+cmd_open(){
+  local name="${1:?usage: mxr open <name>}"
+  load_task "$name"
+  if [ "$T_STATUS" != "active" ]; then die "task $name is archived"; fi
+  local tp
+  tp="$(transcript_path "$T_WD" "$T_SID")"
+  if [ ! -f "$tp" ]; then
+    die "task '$name' has no conversation yet; send first: mxr send $name \"...\""
+  fi
+  local sess="task-$name" envf
+  envf="$MXR_HOME/sessions/task-${name}.env"
+  {
+    printf 'MAXCLAUDE_WORKDIR=%s\n' "$T_WD"
+    printf 'MAXCLAUDE_ORG=%s\n' "$T_ORG"
+    printf 'MAXCLAUDE_RESUME_SID=%s\n' "$T_SID"
+    if [ -f "$WORKER_SETTINGS" ]; then
+      printf 'MAXCLAUDE_SETTINGS=%s\n' "$WORKER_SETTINGS"
+    fi
+    # paned workers otherwise get NO system prompt; inject the non-interactive
+    # directive so they surface decisions as text instead of a blocking menu.
+    printf 'MAXCLAUDE_APPEND_PROMPT=%s\n' "$(preamble)"
+  } > "$envf"
+  if [ ! -f "$WORKER_SETTINGS" ]; then
+    echo "mxr: warning: $WORKER_SETTINGS missing; pane replies will not reach the outbox" >&2
+  fi
+  printf '1\n' > "$MXR_HOME/task-${name}.panes"
+  if session_live "$name"; then
+    reg_set_field "$T_NAME" mode paned
+    echo "task $name already paned; attach: maxclaude attach $sess"
+    return 0
+  fi
+  pretrust_dir "$T_WD"
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  local esc
+  esc="$(systemd-escape "$sess")"
+  if ! systemctl --user start "maxclaude-named@${esc}.service" >/dev/null 2>&1; then
+    zj --layout cc1 attach --create-background "$sess" >/dev/null
+  fi
+  reg_set_field "$T_NAME" mode paned
+  # readiness: single-pane layouts always expose terminal_0
+  local i scr ready=0 answered_resume=0
+  for i in $(seq 1 30); do
+    scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' || true)"
+    if grep -q 'bypass permissions on' <<<"$scr" && grep -q '❯' <<<"$scr"; then
+      ready=1; break
+    fi
+    # Pre-answer claude's resume-from-summary menu (default: resume from summary),
+    # the way pretrust_dir pre-accepts the trust dialog. Resuming an old/compacted
+    # session otherwise blocks here forever (INCIDENT 2026-08-02). Gated on
+    # resume/summary wording so we never press Enter on an unrelated dialog.
+    if [ "$answered_resume" = 0 ] \
+       && grep -qE "$BLOCK_SIG" <<<"$scr" \
+       && grep -qiE 'resume|summary|compact|previous conversation|continue where' <<<"$scr"; then
+      zj --session "$sess" action write -p terminal_0 13 >/dev/null 2>&1 || true
+      log_line "$T_NAME" "$T_ORG" router "pre-answered resume-from-summary menu (default) on open"
+      answered_resume=1
+    fi
+    sleep 1
+  done
+  : "$i"
+  if [ "$ready" = 1 ]; then
+    echo "task $name promoted to pane (resumed sid $T_SID); attach: maxclaude attach $sess"
+  else
+    echo "task $name pane started but TUI not confirmed ready after 30s; attach: maxclaude attach $sess"
+  fi
+}
+
+cmd_close(){
+  local name="${1:?usage: mxr close <name>}"
+  load_task "$name"
+  local esc
+  esc="$(systemd-escape "task-$name")"
+  systemctl --user disable --now "maxclaude-named@${esc}.service" >/dev/null 2>&1 || true
+  zj delete-session --force "task-$name" >/dev/null 2>&1 || true
+  reg_set_field "$T_NAME" mode headless
+  echo "task $name demoted to headless (conversation kept, sid $T_SID)"
+}
+
+cmd_archive(){
+  local name="${1:?usage: mxr archive <name>}"
+  load_task "$name"
+  local esc
+  esc="$(systemd-escape "task-$name")"
+  systemctl --user disable --now "maxclaude-named@${esc}.service" >/dev/null 2>&1 || true
+  zj delete-session --force "task-$name" >/dev/null 2>&1 || true
+  reg_set_field "$T_NAME" mode headless
+  reg_set_field "$T_NAME" status archived
+  log_line "$T_NAME" "$T_ORG" router "task archived"
+  echo "archived task $name"
+}
+
+cmd_log(){
+  local n=20 pat=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) shift; n="${1:?-n needs N}" ;;
+      *) pat="$1" ;;
+    esac
+    shift
+  done
+  if [ ! -f "$LOG" ]; then return 0; fi
+  if [ -n "$pat" ]; then
+    grep -- "$pat" "$LOG" | tail -n "$n" || true
+  else
+    tail -n "$n" "$LOG"
+  fi
+}
+
+cmd_status(){
+  local as_json=0
+  if [ "${1:-}" = "--json" ]; then as_json=1; fi
+  local sessions router_live=false router_unit web_unit
+  sessions="$(live_sessions)"
+  if grep -qxF router <<<"$sessions"; then router_live=true; fi
+  router_unit="$(systemctl --user is-active maxclaude-named@router.service 2>/dev/null || true)"
+  web_unit="$(systemctl --user is-active maxrouter-web.service 2>/dev/null || true)"
+  if [ "$as_json" = 1 ]; then
+    jq -n --slurpfile reg "$REG" --arg sess "$sessions" --argjson rl "$router_live" \
+       --arg ru "${router_unit:-unknown}" --arg wu "${web_unit:-unknown}" '
+      {tasks: ($reg[0].tasks // {}),
+       sessions: ($sess | split("\n") | map(select(length > 0))),
+       router: {session_live: $rl, unit: $ru},
+       web: {unit: $wu}}'
+  else
+    cmd_tasks
+    echo
+    echo "zellij sessions: $(tr '\n' ' ' <<<"$sessions")"
+    echo "router: session_live=$router_live unit=${router_unit:-unknown}"
+    echo "web:    unit=${web_unit:-unknown}"
+  fi
+}
+
+main(){
+  ensure_home
+  local cmd="${1:-}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    orgs)    cmd_orgs "$@" ;;
+    tasks)   cmd_tasks "$@" ;;
+    new)     cmd_new "$@" ;;
+    send)    cmd_send "$@" ;;
+    open)    cmd_open "$@" ;;
+    close)   cmd_close "$@" ;;
+    archive) cmd_archive "$@" ;;
+    trust)   pretrust_dir "${1:?usage: mxr trust <dir>}" ;;
+    log)     cmd_log "$@" ;;
+    status)  cmd_status "$@" ;;
+    peek)    cmd_peek "$@" ;;
+    watch)   cmd_watch "$@" ;;
+    health)  cmd_health "$@" ;;
+    ps)      cmd_ps "$@" ;;
+    notify)  cmd_notify "$@" ;;
+    __run-turn) cmd_run_turn "$@" ;;   # internal: detached headless turn runner
+    ""|help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,22 @@
+[Unit]
+Description=Persistent Claude Code zellij workspace (named %I)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Keep the daemonized zellij server alive after the oneshot ExecStart returns.
+KillMode=process
+Environment=IS_SANDBOX=1
+# Background server has no TERM/COLORTERM of its own; panes inherit these.
+Environment=TERM=xterm-256color
+Environment=COLORTERM=truecolor
+# %I = unescaped session name. Pane layout comes from the per-session state file
+# (<maxclaude config>/<name>.panes) written by maxrouter or maxclaude.
+# Missing or invalid state selects one pane. A live session is left unchanged.
+ExecStart=%h/.local/bin/maxclaude-svc start %I
+ExecStop=%h/.local/bin/maxclaude-svc stop %I
+
+# No [Install] section, by design: this unit is NOT boot-persistent. maxrouter
+# and mxr open start it with `systemctl --user start` (linger keeps it alive
+# across SSH disconnect); it must never respawn on reboot.
