@@ -55,7 +55,7 @@ function normalizeSessionStatus(data) {
   const out = {};
   for (const [name, value] of Object.entries(sessions)) {
     if (typeof name !== 'string' || !name) continue;
-    if (!value || !['busy', 'background', 'idle', 'absent', 'unknown'].includes(value.state)) continue;
+    if (!value || !['busy', 'background', 'idle', 'absent', 'unknown', 'sleeping', 'waking'].includes(value.state)) continue;
     const updatedAt = Math.max(0, Number(value.updatedAt) || 0);
     const lastResponseAt = Math.max(0, Number(value.lastResponseAt) || 0);
     const lastActivityAt = Object.hasOwn(value, 'lastActivityAt')
@@ -65,7 +65,11 @@ function normalizeSessionStatus(data) {
       state: value.state,
       updatedAt,
       lastResponseAt,
-      lastActivityAt
+      lastActivityAt,
+      descendantTaskCount: Math.max(0, Number(value.descendantTaskCount) || 0),
+      viewerCount: Math.max(0, Number(value.viewerCount) || 0),
+      resumable: value.resumable === true,
+      operatorActive: value.operatorActive === true,
     };
   }
   return out;
@@ -359,7 +363,7 @@ export class Tunnel extends EventEmitter {
 
   rpc(method, params = {}, timeoutMs = config.agentRpcTimeoutMs) {
     if (!this.connected) {
-      return Promise.reject(new TunnelError('agent_disconnected', 'the agent is not connected'));
+      return Promise.reject(new TunnelError('agent_disconnected', 'the agent on the session host is not connected'));
     }
     this.rpcSeq += 1;
     const id = `r-${this.rpcSeq}`;
@@ -375,7 +379,7 @@ export class Tunnel extends EventEmitter {
 
   proxyHttp(req, res, path) {
     if (!this.connected) {
-      res.status(503).json({ error: 'agent_disconnected', message: 'the agent is not connected' });
+      res.status(503).json({ error: 'agent_disconnected', message: 'the agent on the session host is not connected' });
       return;
     }
 
@@ -506,7 +510,7 @@ export class Tunnel extends EventEmitter {
   }
 
   async upload(req, { session, batch, uploadId, path, size, totalSize = size, offset = 0, final = true }) {
-    if (!this.connected) throw new TunnelError('agent_disconnected', 'the agent is not connected');
+    if (!this.connected) throw new TunnelError('agent_disconnected', 'the agent on the session host is not connected');
     if (!Number.isInteger(size) || size < 0 || !Number.isInteger(totalSize)
       || totalSize < 0 || totalSize > MAX_UPLOAD_BYTES) {
       throw new TunnelError('bad_request', 'a single upload may not exceed 2 GB');
@@ -545,7 +549,7 @@ export class Tunnel extends EventEmitter {
   }
 
   async download(req, res, { session, path }) {
-    if (!this.connected) throw new TunnelError('agent_disconnected', 'the agent is not connected');
+    if (!this.connected) throw new TunnelError('agent_disconnected', 'the agent on the session host is not connected');
     const id = this.nextChannel('file');
     const channel = new DownloadChannel(this, id, req, res);
     this.fileChannels.set(id, channel);

@@ -394,6 +394,7 @@ install -m 0755 "$SRC_DIR/bin/mxr-notifyd" "$BIN_DIR/mxr-notifyd"
 install -m 0755 "$SRC_DIR/bin/mxr-blockd" "$BIN_DIR/mxr-blockd"
 install -m 0755 "$SRC_DIR/bin/mxr-heartbeatd" "$BIN_DIR/mxr-heartbeatd"
 install -m 0755 "$SRC_DIR/bin/maxrouter-webd" "$BIN_DIR/maxrouter-webd"
+install -m 0755 "$SRC_DIR/bin/maxclaude-browser-reaper" "$BIN_DIR/maxclaude-browser-reaper"
 ok "commands  -> router tools, maxclaude-pane, and maxclaude-restore in $BIN_DIR"
 # Router pane path (maxclaude-named@ -> maxclaude-svc -> cc* layouts): install
 # only when missing so a live box's tuned copies are kept.
@@ -459,6 +460,11 @@ if [ -n "$USE_SYSTEMD" ]; then
   install -m 0644 "$SRC_DIR/systemd/maxrouter-notify.service" "$UNIT_DIR/"
   install -m 0644 "$SRC_DIR/systemd/maxrouter-blockd.service" "$UNIT_DIR/"
   install -m 0644 "$SRC_DIR/systemd/maxrouter-heartbeat.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxclaude-browser-reaper.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR/systemd/maxclaude-browser-reaper.timer" "$UNIT_DIR/"
+  if [ ! -f "$AGENT_CFG_DIR/browser-reaper.env" ]; then
+    ( umask 077; printf 'MAXCLAUDE_BROWSER_MAX_HOURS=0\n' > "$AGENT_CFG_DIR/browser-reaper.env" )
+  fi
   # maxclaude-named@ drives the router-mode sessions; keep a live box's copy.
   if [ ! -f "$UNIT_DIR/maxclaude-named@.service" ]; then
     install -m 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
@@ -469,6 +475,7 @@ if [ -n "$USE_SYSTEMD" ]; then
   systemctl --user enable --now maxrouter-notify.service 2>/dev/null || true
   systemctl --user enable --now maxrouter-blockd.service 2>/dev/null || true
   systemctl --user enable --now maxrouter-heartbeat.service 2>/dev/null || true
+  systemctl --user enable --now maxclaude-browser-reaper.timer 2>/dev/null || true
   ok "services  -> maxagent, maxclaude, and maxrouter user units in $UNIT_DIR"
   if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
     warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"

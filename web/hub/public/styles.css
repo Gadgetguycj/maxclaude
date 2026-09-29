@@ -168,6 +168,8 @@ body.sidebar-collapsed .sidebar-rail { display: grid; }
 .dot.st-busy { background: var(--ok); animation: activity-blink .9s steps(2, start) infinite; }
 .dot.st-background { background: var(--ok); animation: background-pulse 2.4s ease-in-out infinite; }
 .dot.st-idle { background: var(--warn); }
+.dot.st-sleeping { background: #7c6aa8; box-shadow: inset 0 0 0 1px #b6a5df; }
+.dot.st-waking { background: #8e7bc3; animation: background-pulse 1s ease-in-out infinite; }
 .dot.st-absent { background: transparent; box-shadow: inset 0 0 0 1.5px var(--dim); }
 .dot.st-exited { background: var(--warn); }
 .dot.st-missing { background: transparent; box-shadow: inset 0 0 0 1.5px var(--dim); }
@@ -179,7 +181,7 @@ body.sidebar-collapsed .sidebar-rail { display: grid; }
 .recent-limit { flex: 0 0 auto; min-width: 45px; height: 18px; color: var(--text); background: var(--panel2); border: 1px solid #333a47; border-radius: 3px; padding: 0 3px; font: inherit; font-size: 11px; }
 @keyframes activity-blink { 50% { opacity: .25; } }
 @keyframes background-pulse { 50% { opacity: .4; transform: scale(.82); } }
-.document-hidden .dot.st-busy, .document-hidden .dot.st-background { animation: none; }
+.document-hidden .dot.st-busy, .document-hidden .dot.st-background, .document-hidden .dot.st-waking { animation: none; }
 
 .empty { color: var(--dim); padding: 18px 14px; text-align: center; }
 .empty.small { font-size: 13.5px; }

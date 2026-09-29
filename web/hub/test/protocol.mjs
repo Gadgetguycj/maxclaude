@@ -99,7 +99,7 @@ class FakeAgent {
         }
         if (msg.t === 'auth.ok') {
           this.authed = true;
-          ws.send(JSON.stringify({ t: 'event', event: 'agent.ready', data: { host: 'the agent host', webSharing: 'on' } }));
+          ws.send(JSON.stringify({ t: 'event', event: 'agent.ready', data: { host: 'the session host', webSharing: 'on' } }));
           resolve('auth.ok');
           return;
         }
@@ -123,7 +123,7 @@ class FakeAgent {
     if (msg.t === 'http.req') return this.onHttpReq(msg);
     if (msg.t === 'ws.open') return this.onWsOpen(msg);
     if (msg.t === 'file.upload.open') {
-      const batchRoot = `the configured file area/${msg.session}/in/20260924T000000000Z`;
+      const batchRoot = `/tmp/mcw-files/${msg.session}/in/20260101T000000000Z`;
       const filePath = `${batchRoot}/${msg.path}`;
       this.uploadChannels.set(msg.id, { ...msg, filePath, batchRoot, chunks: [] });
       return this.send({ t: 'file.upload.ready', id: msg.id, path: filePath, batchRoot });
@@ -160,6 +160,12 @@ class FakeAgent {
   onReq(msg) {
     if (msg.method === 'sessions.list') {
       return this.send({ t: 'res', id: msg.id, ok: true, result: { sessions: this.sessions } });
+    }
+    if (msg.method === 'sessions.reserveViewer') {
+      return this.send({ t: 'res', id: msg.id, ok: true, result: { name: msg.params.name, leaseId: 'test-lease' } });
+    }
+    if (msg.method === 'sessions.releaseViewer') {
+      return this.send({ t: 'res', id: msg.id, ok: true, result: { released: true } });
     }
     if (msg.method === 'sessions.create') {
       if (this.sessions.some((s) => s.name === msg.params.name)) {
@@ -359,7 +365,7 @@ check('a correct proof authenticates and agent.ready is recorded', async () => {
   assert.equal(result, 'auth.ok');
   await waitFor(async () => {
     const state = await api('GET', '/api/state', { cookie });
-    return state.json?.agent?.connected === true && state.json?.agent?.host === 'the agent host';
+    return state.json?.agent?.connected === true && state.json?.agent?.host === 'the session host';
   }, 5000, 'agent connected in /api/state');
 });
 
@@ -388,15 +394,15 @@ check('status snapshots are retained and appear in state and the authenticated e
 check('recents are strictly descending by the reported activity timestamp', async () => {
   const originalSessions = live.sessions;
   const points = {
-    'session-a': Date.parse('2026-09-28T22:45:17.000Z'),
-    'session-b': Date.parse('2026-09-28T22:45:16.000Z'),
-    'session-c': Date.parse('2026-09-28T22:43:02.000Z'),
-    'session-d': Date.parse('2026-09-28T22:44:50.000Z'),
-    'session-e': Date.parse('2026-09-28T22:23:18.000Z'),
+    'beta-session': Date.parse('2026-09-28T22:45:17.000Z'),
+    'alpha-session': Date.parse('2026-09-28T22:45:16.000Z'),
+    'delta-session': Date.parse('2026-09-28T22:43:02.000Z'),
+    'gamma-session': Date.parse('2026-09-28T22:44:50.000Z'),
+    'epsilon-session': Date.parse('2026-09-28T22:23:18.000Z'),
   };
   live.sessions = Object.entries(points).map(([name, lastActivityAt], index) => ({
     name, created: 'Created 1h ago', createdAt: 1000 + index,
-    activity: name === 'session-c' ? 'busy' : 'idle',
+    activity: name === 'delta-session' ? 'busy' : 'idle',
     activityUpdatedAt: lastActivityAt, lastActivityAt, lastResponseAt: 0,
     exited: false, current: false,
   }));
@@ -411,7 +417,7 @@ check('recents are strictly descending by the reported activity timestamp', asyn
       }]))
     }
   });
-  const expected = ['session-a', 'session-b', 'session-d', 'session-c', 'session-e'];
+  const expected = ['beta-session', 'alpha-session', 'gamma-session', 'delta-session', 'epsilon-session'];
   await waitFor(async () => {
     const state = await api('GET', '/api/state', { cookie });
     return state.json?.recents?.length === 5;

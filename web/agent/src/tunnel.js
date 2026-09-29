@@ -8,6 +8,7 @@ import { HttpProxy } from './httpproxy.js';
 import { WsProxy } from './wsproxy.js';
 import { decodeFrame, KIND_WS_DATA, KIND_HTTP_BODY, KIND_FILE_UPLOAD } from './frames.js';
 import { FileTransfers } from './files.js';
+import { clearViewers } from './viewers.js';
 
 const IDLE_MS = 60000;
 const PING_MS = 25000;
@@ -216,6 +217,7 @@ export class Tunnel {
     clearInterval(this.pingTimer);
     if (this.http) this.http.closeAll();
     if (this.wsp) this.wsp.closeAll();
+    clearViewers();
     if (this.files) this.files.closeAll();
     if (this.ws) {
       try {

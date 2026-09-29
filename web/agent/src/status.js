@@ -44,8 +44,10 @@ function readProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackground
   const claudePanes = new Map();
   const backgroundRoots = new Map();
   const backgroundOutput = new Map();
+  const backgroundPanes = new Map();
+  const sessionTagged = [];
   let entries = [];
-  try { entries = fs.readdirSync(procRoot, { withFileTypes: true }); } catch { return { claudePanes, backgroundPanes: new Map() }; }
+  try { entries = fs.readdirSync(procRoot, { withFileTypes: true }); } catch { return { claudePanes, backgroundPanes }; }
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
     const proc = path.join(procRoot, entry.name);
@@ -57,6 +59,12 @@ function readProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackground
     let startedAt = 0;
     try { startedAt = Math.floor(fs.statSync(proc).ctimeMs); } catch { /* process exited while sampled */ }
     const key = `${session}\0${pane}`;
+    let ppid = 0;
+    try {
+      const match = fs.readFileSync(path.join(proc, 'status'), 'utf8').match(/^PPid:\s+(\d+)/m);
+      ppid = Number(match?.[1] || 0);
+    } catch { /* process exited while sampled */ }
+    sessionTagged.push({ pid: Number(entry.name), ppid, session, pane, command, startedAt });
     if (isClaudeCommand(command)) {
       const previous = claudePanes.get(key);
       const started = previous?.startedAt && startedAt
@@ -94,7 +102,6 @@ function readProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackground
       sessionId,
     });
   }
-  const backgroundPanes = new Map();
   for (const [backgroundKey, root] of backgroundRoots) {
     const key = `${root.session}\0${root.pane}`;
     const mainPids = new Set(claudePanes.get(key)?.pids || []);
@@ -110,15 +117,43 @@ function readProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackground
       sessionIds: [...new Set([...(previous?.sessionIds || []), root.sessionId])],
     });
   }
-  return { claudePanes, backgroundPanes };
+  const claudePidsBySession = new Map();
+  for (const pane of claudePanes.values()) {
+    if (!claudePidsBySession.has(pane.session)) claudePidsBySession.set(pane.session, new Set());
+    for (const pid of pane.pids) claudePidsBySession.get(pane.session).add(pid);
+  }
+  const detachedCandidates = sessionTagged.filter((process) => {
+    const executable = path.basename(process.command[0]);
+    if (/^zellij(?:\.exe)?$/.test(executable) || isClaudeCommand(process.command)) return false;
+    const claudePids = claudePidsBySession.get(process.session);
+    return !claudePids?.size || !descendsFrom(process.pid, claudePids, procRoot);
+  });
+  const detachedIds = new Set(detachedCandidates.map((process) => process.pid));
+  const detachedSessions = new Map();
+  for (const process of detachedCandidates) {
+    if (detachedIds.has(process.ppid)) continue;
+    const prior = detachedSessions.get(process.session) || { pids: [], startedAt: 0 };
+    prior.pids.push(process.pid);
+    prior.startedAt = Math.max(prior.startedAt, process.startedAt || 0);
+    detachedSessions.set(process.session, prior);
+  }
+  return { claudePanes, backgroundPanes, detachedSessions };
 }
 
 export function readLiveClaudePanes(procRoot = '/proc') {
   return readProcessSnapshot(procRoot).claudePanes;
 }
 
+export function readSessionProcessSnapshot(procRoot = '/proc', now = Date.now(), minBackgroundAgeMs = 2000) {
+  return readProcessSnapshot(procRoot, now, minBackgroundAgeMs);
+}
+
 export function readLiveBackgroundPanes(procRoot = '/proc', now = Date.now(), minAgeMs = 2000) {
   return readProcessSnapshot(procRoot, now, minAgeMs).backgroundPanes;
+}
+
+export function readDetachedSessionTasks(procRoot = '/proc') {
+  return readProcessSnapshot(procRoot).detachedSessions;
 }
 
 function readPaneStatus(session, pane, statusDir) {
@@ -280,6 +315,12 @@ function transcriptTimestamps(file) {
   return value;
 }
 
+export function hiddenSessionActivity({ workdir, resumeSid, projectsDir = config.projectsDir }) {
+  if (!workdir || !resumeSid) return { lastResponseAt: 0, lastActivityAt: 0 };
+  const timestamps = transcriptTimestamps(path.join(projectsDir, projectKey(workdir), `${resumeSid}.jsonl`));
+  return { lastResponseAt: timestamps.assistantAt, lastActivityAt: timestamps.activityAt };
+}
+
 function lastResponseForPane(session, pane, status, transcriptPath, allowTranscript, options) {
   const response = readResponseStatus(session, pane.pane, options.statusDir || config.statusDir);
   if (response) {
@@ -293,6 +334,7 @@ function lastResponseForPane(session, pane, status, transcriptPath, allowTranscr
 export function aggregateSessionActivity(sessionNames, livePanes, options = {}) {
   const statusDir = options.statusDir || config.statusDir;
   const backgroundPanes = options.backgroundPanes || new Map();
+  const detachedSessions = options.detachedSessions || new Map();
   const envIds = sessionEnvIds(options.sessionEnvDir || config.sessionEnvDir);
   const result = {};
   const statesBySession = new Map();
@@ -300,7 +342,9 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
   for (const name of sessionNames) {
     const panes = [...livePanes.values()].filter((pane) => pane.session === name);
     if (!panes.length) {
-      result[name] = { state: 'absent', updatedAt: 0, lastResponseAt: 0, lastActivityAt: 0 };
+      const detached = detachedSessions.get(name);
+      result[name] = { state: detached ? 'background' : 'absent', updatedAt: detached?.startedAt || 0, lastResponseAt: 0, lastActivityAt: detached?.startedAt || 0 };
+      Object.defineProperty(result[name], 'descendantTaskCount', { value: detached?.pids?.length || 0 });
       continue;
     }
     const states = panes.map((pane) => {
@@ -330,6 +374,11 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
   }
 
   for (const [name, states] of statesBySession) {
+    const detachedTaskCount = detachedSessions.get(name)?.pids?.length || 0;
+    const descendantTaskCount = detachedTaskCount + states.reduce((count, state) => count + Math.max(
+      state.processBackground?.pids?.length || 0,
+      state.backgroundStatus?.taskCount || 0
+    ), 0);
     const lastResponseAt = Math.max(0, ...states.map(({ pane, status, transcriptPath }) => {
       const uniqueTranscript = !transcriptPath || transcriptSessions.get(transcriptPath)?.size === 1;
       return lastResponseForPane(name, pane, status, transcriptPath, uniqueTranscript, { ...options, statusDir });
@@ -349,22 +398,24 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
         lastResponseAt,
         lastActivityAt,
       };
+      Object.defineProperty(result[name], 'descendantTaskCount', { value: descendantTaskCount });
       continue;
     }
     const background = states.filter(({ hasBackgroundProcess }) => hasBackgroundProcess);
-    if (background.length) {
+    if (background.length || detachedTaskCount) {
       const backgroundActivityAt = Math.max(...background.map(({ backgroundStatus, processBackground }) => (
         Math.max(
           processBackground?.activityAt || processBackground?.startedAt || 0,
           backgroundStatus?.taskCount > 0 ? backgroundStatus.updatedAt : 0
         )
-      )));
+      )), detachedSessions.get(name)?.startedAt || 0);
       result[name] = {
         state: 'background',
         updatedAt: backgroundActivityAt,
         lastResponseAt,
         lastActivityAt: Math.max(lastActivityAt, backgroundActivityAt),
       };
+      Object.defineProperty(result[name], 'descendantTaskCount', { value: descendantTaskCount });
       continue;
     }
     if (states.some(({ status }) => !status)) {
@@ -374,6 +425,7 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
         lastResponseAt,
         lastActivityAt,
       };
+      Object.defineProperty(result[name], 'descendantTaskCount', { value: descendantTaskCount });
       continue;
     }
     result[name] = {
@@ -382,15 +434,16 @@ export function aggregateSessionActivity(sessionNames, livePanes, options = {}) 
       lastResponseAt,
       lastActivityAt,
     };
+    Object.defineProperty(result[name], 'descendantTaskCount', { value: descendantTaskCount });
   }
   return result;
 }
 
 export function collectSessionActivity(sessionNames, options = {}) {
-  const procRoot = options.procRoot || '/proc';
-  const snapshot = readProcessSnapshot(procRoot);
+  const snapshot = options.snapshot || readProcessSnapshot(options.procRoot || '/proc');
   return aggregateSessionActivity(sessionNames, snapshot.claudePanes, {
     ...options,
     backgroundPanes: snapshot.backgroundPanes,
+    detachedSessions: snapshot.detachedSessions,
   });
 }

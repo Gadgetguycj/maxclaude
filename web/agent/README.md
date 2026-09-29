@@ -24,8 +24,11 @@ The defaults use the current user's home and configuration directories. The inst
 | `MCW_WEB_HOST` | `127.0.0.1` | Local zellij web listen address. |
 | `MCW_WEB_PORT` | `8082` | Local zellij web listen port. |
 | `MCW_MAXCLAUDE_CFG` | `$XDG_CONFIG_HOME/maxclaude` | maxclaude session metadata directory. |
+| `MCW_AUTO_HIBERNATE_HOURS` | `0` | Idle-session hibernation threshold in hours. `0` disables it. |
 | `MCW_TRANSCRIPT_DIR` | `$CLAUDE_CONFIG_DIR/projects` | Transcript search root. |
 | `MCW_DEFAULT_WORKDIR` | `$HOME` | Working directory for sessions created in the browser. |
+
+When enabled, automatic hibernation scans every ten minutes. It only hibernates an idle, resumable session with no live descendant task, no browser viewer, and no active operator client. Sleeping sessions remain visible and wake into their recorded Claude conversation.
 | `MCW_AGENT_NAME` | current hostname | Agent name shown to the hub. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude Code configuration directory. |
 | `XDG_CONFIG_HOME` | `$HOME/.config` | Base user configuration directory. |

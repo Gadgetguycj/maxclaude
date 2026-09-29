@@ -36,6 +36,8 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
   for u in maxrouter-web.service maxrouter-notify.service maxrouter-blockd.service maxrouter-heartbeat.service; do
     systemctl --user disable --now "$u" >/dev/null 2>&1 || true
   done
+  systemctl --user disable --now maxclaude-browser-reaper.timer >/dev/null 2>&1 || true
+  systemctl --user stop maxclaude-browser-reaper.service >/dev/null 2>&1 || true
 fi
 
 # Router mode (maxrouter): remove what install.sh's router section added.
@@ -44,9 +46,11 @@ MAXCLAUDE_CFG_DIR="${MAXROUTER_CONFIG_HOME:-$CFG_DIR/maxclaude}"
 rm -f "$BIN_DIR/mxr" "$BIN_DIR/maxrouter" "$BIN_DIR/mxr-outbox" \
       "$BIN_DIR/mxr-notify" "$BIN_DIR/mxr-notifyd" "$BIN_DIR/mxr-blockd" \
       "$BIN_DIR/mxr-heartbeatd" "$BIN_DIR/maxrouter-webd" \
-      "$BIN_DIR/maxclaude-pane" "$BIN_DIR/maxclaude-restore"
+      "$BIN_DIR/maxclaude-pane" "$BIN_DIR/maxclaude-restore" \
+      "$BIN_DIR/maxclaude-browser-reaper"
 rm -f "$UNIT_DIR/maxrouter-web.service" "$UNIT_DIR/maxrouter-notify.service" \
-      "$UNIT_DIR/maxrouter-blockd.service" "$UNIT_DIR/maxrouter-heartbeat.service"
+      "$UNIT_DIR/maxrouter-blockd.service" "$UNIT_DIR/maxrouter-heartbeat.service" \
+      "$UNIT_DIR/maxclaude-browser-reaper.service" "$UNIT_DIR/maxclaude-browser-reaper.timer"
 rm -f "$MAXCLAUDE_CFG_DIR/router/CLAUDE.md" "$MAXCLAUDE_CFG_DIR/router/worker-settings.json"
 rm -rf "$MAXCLAUDE_CFG_DIR/router/outbox" "$MAXCLAUDE_CFG_DIR/sessions"
 rmdir "$MAXCLAUDE_CFG_DIR/router" 2>/dev/null || true

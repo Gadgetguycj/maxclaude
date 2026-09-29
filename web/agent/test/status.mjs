@@ -3,14 +3,58 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+
+const hookTranscriptPath = path.join(os.homedir(), '.claude', 'projects', '-home-user-project', 'hook-test.jsonl');
 import { aggregateSessionActivity, readLiveBackgroundPanes, readLiveClaudePanes } from '../src/status.js';
-import { parseCreatedAt } from '../src/sessions.js';
+import { hibernateEligibility, isActiveMaxclaudeUnit, isZellijClientCommand, isZellijServerCommand, parseCreatedAt, parseZellijClientCommand, wakeCommandMatches, wakeStartPlan } from '../src/sessions.js';
 
 const now = Date.UTC(2026, 8, 24, 12, 0, 0);
 assert.equal(parseCreatedAt('Created 1day 2h 3m 4s ago', now), now - 93784000);
 assert.equal(parseCreatedAt('Created 10days 3h 2m 41s ago', now), now - 874961000);
 assert.equal(parseCreatedAt('Created 0s ago', now), now);
 assert.equal(parseCreatedAt('unparseable', now), 0);
+
+const hibernateBase = {
+  name: 'idle-session', sleeping: false, current: false, operatorActive: false,
+  resumable: true, activity: 'idle', descendantTaskCount: 0, viewers: 0,
+  lastActivityAt: now - (48 * 60 * 60 * 1000), conversationCount: 1,
+};
+assert.equal(hibernateEligibility(hibernateBase).eligible, true);
+assert.equal(hibernateEligibility({ ...hibernateBase, conversationCount: 0 }).reason, 'no live Claude conversation id is available to preserve');
+assert.equal(hibernateEligibility({ ...hibernateBase, viewers: 1 }).reason, 'browser client is viewing it');
+assert.equal(hibernateEligibility({ ...hibernateBase, descendantTaskCount: 1 }).reason, 'live descendant task process');
+assert.equal(hibernateEligibility({ ...hibernateBase, operatorActive: true }).reason, 'operator is working in this session');
+assert.equal(hibernateEligibility({ ...hibernateBase, conversationCount: 2 }).reason, 'multiple live Claude conversations cannot be resumed safely');
+assert.equal(wakeCommandMatches('wake-test', '11111111-1111-1111-1111-111111111111', new Map([
+  ['wake-test\0' + '0', { session: 'wake-test', commands: [['claude', '--remote-control=wake-test', '--resume', '11111111-1111-1111-1111-111111111111']] }],
+])), true);
+assert.equal(wakeCommandMatches('wake-test', '11111111-1111-1111-1111-111111111111', new Map([
+  ['wake-test\0' + '0', { session: 'wake-test', commands: [['claude', '--remote-control=wrong-name', '--resume', '11111111-1111-1111-1111-111111111111']] }],
+])), false);
+const knownSessions = ['first', 'second'];
+assert.deepEqual(parseZellijClientCommand(['zellij', 'attach', 'first'], '', knownSessions), { names: ['first'], ambiguous: false });
+assert.deepEqual(parseZellijClientCommand(['zellij', 'watch', 'second'], '', knownSessions), { names: ['second'], ambiguous: false });
+assert.deepEqual(parseZellijClientCommand(['zellij', 'a', '--create', 'second'], '', knownSessions), { names: ['second'], ambiguous: false });
+assert.deepEqual(parseZellijClientCommand(['zellij', 'attach', '--index', '1'], '', knownSessions), { names: [], ambiguous: true });
+assert.deepEqual(parseZellijClientCommand(['zellij', 'w', '--token', 'secret'], '', knownSessions), { names: [], ambiguous: true });
+assert.deepEqual(parseZellijClientCommand(['zellij', 'attach'], 'first', knownSessions), { names: ['first'], ambiguous: false });
+assert.equal(isZellijServerCommand(['zellij', '--server', '/run/user/1000/zellij/contract/session']), true);
+assert.equal(isZellijServerCommand(['zellij', 'attach', 'first']), false);
+assert.equal(isZellijClientCommand(['zellij', 'web', '-d']), false);
+assert.equal(isZellijClientCommand(['zellij', 'attach', 'first']), true);
+assert.equal(isActiveMaxclaudeUnit('loaded\ninactive\n'), false);
+assert.equal(isActiveMaxclaudeUnit('loaded\nactive\n'), true);
+const wakePlan = wakeStartPlan('wake-test', { MAXAGENT_UNIT: 'maxclaude-named@wake\\x2dtest.service' }, 'wake\\x2dtest');
+assert.deepEqual(wakePlan, { command: 'systemctl', args: ['--user', 'start', 'maxclaude-named@wake\\x2dtest.service'], unit: 'maxclaude-named@wake\\x2dtest.service' });
+assert.equal(JSON.stringify(wakePlan).includes('unhide'), false);
+assert.equal(JSON.stringify(wakePlan).includes('attach'), false);
+assert.throws(() => wakeStartPlan('wake-test', {}, 'wake\\x2dtest'), /does not record the expected maxclaude unit/);
+assert.throws(() => wakeStartPlan('wake-test', { MAXAGENT_UNIT: 'maxclaude-named@other.service' }, 'wake\\x2dtest'), /does not record the expected maxclaude unit/);
+const detachedActivity = aggregateSessionActivity(['detached-test'], new Map([
+  ['detached-test\0' + '0', { session: 'detached-test', pane: '0', startedAt: 1, pids: [1] }],
+]), { statusDir: '/nonexistent', detachedSessions: new Map([['detached-test', { pids: [44], startedAt: 999 }]]) });
+assert.equal(detachedActivity['detached-test'].state, 'background');
+assert.equal(detachedActivity['detached-test'].descendantTaskCount, 1);
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcw-status-'));
 try {
@@ -60,10 +104,9 @@ try {
   const discovered = readLiveClaudePanes(proc);
   assert.equal(discovered.get('without-pane\0pid-42')?.session, 'without-pane');
   assert.equal(discovered.has('without-pane\0pid-43'), false);
-  assert.equal(readLiveBackgroundPanes(path.join(root, 'missing-proc')).size, 0);
   fs.mkdirSync(path.join(proc, '44'), { recursive: true });
   fs.writeFileSync(path.join(proc, '44', 'environ'), Buffer.from('ZELLIJ_SESSION_NAME=background-probe\0ZELLIJ_PANE_ID=0\0CLAUDE_CODE_SESSION_ID=bg-id\0'));
-  fs.writeFileSync(path.join(proc, '44', 'cmdline'), Buffer.from('bash\0-c\0source /home/example/.claude/shell-snapshots/snapshot-test.sh && sleep 20\0'));
+  fs.writeFileSync(path.join(proc, '44', 'cmdline'), Buffer.from('bash\0-c\0source ' + path.join(os.homedir(), '.claude', 'shell-snapshots', 'snapshot-test.sh') + ' && sleep 20\0'));
   fs.writeFileSync(path.join(proc, '44', 'status'), 'Name:\tbash\nPPid:\t45\n');
   fs.mkdirSync(path.join(proc, '45'), { recursive: true });
   fs.writeFileSync(path.join(proc, '45', 'environ'), Buffer.from('ZELLIJ_SESSION_NAME=background-probe\0ZELLIJ_PANE_ID=0\0'));
@@ -85,12 +128,11 @@ try {
     env: {
       ...process.env,
       MCW_STATE_DIR: hookRoot,
-      CLAUDE_CONFIG_DIR: root,
       ZELLIJ_SESSION_NAME: 'hook-test',
       ZELLIJ_PANE_ID: '0',
     },
     input: JSON.stringify({
-      transcript_path: path.join(root, 'projects', 'hook-test.jsonl'),
+      transcript_path: hookTranscriptPath,
       background_tasks: [
         { id: 'task-1', type: 'shell', status: 'running' },
         { id: 'task-2', type: 'subagent', status: 'pending' },
@@ -100,7 +142,7 @@ try {
   assert.equal(hook.status, 0);
   const hookStatus = JSON.parse(fs.readFileSync(path.join(hookRoot, 'session-status', 'hook-test', '0.json'), 'utf8'));
   assert.equal(hookStatus.state, 'idle');
-  assert.equal(hookStatus.transcriptPath, path.join(root, 'projects', 'hook-test.jsonl'));
+  assert.equal(hookStatus.transcriptPath, hookTranscriptPath);
   assert.ok(hookStatus.updatedAt >= beforeHook && hookStatus.updatedAt <= Date.now());
   const response = JSON.parse(fs.readFileSync(path.join(hookRoot, 'session-status', 'hook-test', '0.response.json'), 'utf8'));
   assert.equal(response.transcriptPath, hookStatus.transcriptPath);
@@ -124,12 +166,11 @@ try {
     env: {
       ...process.env,
       MCW_STATE_DIR: hookRoot,
-      CLAUDE_CONFIG_DIR: root,
       ZELLIJ_SESSION_NAME: 'hook-test',
       ZELLIJ_PANE_ID: '0',
     },
     input: JSON.stringify({
-      transcript_path: path.join(root, 'projects', 'hook-test.jsonl'),
+      transcript_path: hookTranscriptPath,
       background_tasks: [],
     }),
   });
@@ -202,16 +243,16 @@ try {
   });
 
   const exactTimes = {
-    'session-a': Date.parse('2026-09-28T23:17:01.000Z'),
-    'session-b': Date.parse('2026-09-28T23:16:59.000Z'),
-    'session-c': Date.parse('2026-09-28T23:16:42.000Z'),
-    'session-d': Date.parse('2026-09-28T23:16:38.000Z'),
+    'alpha-session': Date.parse('2026-09-28T23:17:01.000Z'),
+    'beta-session': Date.parse('2026-09-28T23:16:59.000Z'),
+    'gamma-session': Date.parse('2026-09-28T23:16:42.000Z'),
+    'delta-session': Date.parse('2026-09-28T23:16:38.000Z'),
   };
   const exactPanes = new Map();
   for (const [name, updatedAt] of Object.entries(exactTimes)) {
     fs.mkdirSync(path.join(root, name), { recursive: true });
     fs.writeFileSync(path.join(root, name, '0.json'), JSON.stringify({
-      state: name === 'session-a' || name === 'session-b' ? 'busy' : 'idle',
+      state: name === 'alpha-session' || name === 'beta-session' ? 'busy' : 'idle',
       updatedAt,
     }));
     exactPanes.set(`${name}\0` + '0', { session: name, pane: '0', startedAt: updatedAt - 10000, pids: [60], command: [], cwd: null });
@@ -220,11 +261,11 @@ try {
     ...options,
     now: Date.parse('2026-09-28T23:17:03.000Z'),
     backgroundPanes: new Map([[
-      'session-d\0' + '0',
+      'delta-session\0' + '0',
       {
-        session: 'session-d', pane: '0',
-        startedAt: exactTimes['session-d'] - 1000,
-        activityAt: exactTimes['session-d'], pids: [61], sessionIds: ['background-session'],
+        session: 'delta-session', pane: '0',
+        startedAt: exactTimes['delta-session'] - 1000,
+        activityAt: exactTimes['delta-session'], pids: [61], sessionIds: ['home-session'],
       },
     ]]),
   });

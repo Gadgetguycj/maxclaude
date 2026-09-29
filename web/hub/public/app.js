@@ -103,13 +103,13 @@ class ApiError extends Error {
 
 const CODE_TEXT = {
   invalid_credentials: 'Incorrect password.',
-  agent_disconnected: 'The agent on the agent is disconnected.',
+  agent_disconnected: 'The agent on the session host is disconnected.',
   network_error: 'Cannot reach the server.',
   unauthorized: 'Not logged in.',
   not_found: 'Not found.',
   conflict: 'That name is already taken.',
   bad_request: 'The server rejected that request.',
-  upstream_unavailable: 'zellij on the agent is not answering.',
+  upstream_unavailable: 'zellij on the session host is not answering.',
   internal: 'The server hit an internal error.',
   timeout: 'The host took too long to answer.'
 };
@@ -160,6 +160,7 @@ const S = {
   active: LS.get('mcw.active', null),
   sidebarWidth: 300,
   sidebarCollapsed: false,
+  waking: new Set(),
   pollTimer: null,
   fetching: false
 };
@@ -167,7 +168,7 @@ const S = {
 const UNFILED_KEY = '__unfiled__';
 const RECENTS_KEY = '__recents__';
 const FOLDERS_KEY = '__folders__';
-const STATE_TEXT = { busy: 'working', background: 'working in background', idle: 'waiting for input', absent: 'no Claude process', running: 'running', exited: 'exited', missing: 'not created', unknown: 'unknown' };
+const STATE_TEXT = { busy: 'working', background: 'working in background', idle: 'waiting for input', sleeping: 'sleeping', waking: 'waking', absent: 'no Claude process', running: 'running', exited: 'exited', missing: 'not created', unknown: 'unknown' };
 let eventSource = null;
 
 function startEvents() {
@@ -236,12 +237,14 @@ function leafBySession(name) {
 }
 
 function liveState(sessionName) {
+  if (S.waking.has(sessionName)) return 'waking';
   if (!Array.isArray(S.sessions)) return 'unknown';
   for (const s of S.sessions) {
     if (s.name !== sessionName) continue;
     if (s.exited) return 'exited';
     const activity = S.sessionStatus[sessionName]?.state || s.activity;
-    if (activity === 'busy' || activity === 'background' || activity === 'idle' || activity === 'absent' || activity === 'unknown') return activity;
+    if (s.sleeping) return 'sleeping';
+    if (activity === 'busy' || activity === 'background' || activity === 'idle' || activity === 'sleeping' || activity === 'absent' || activity === 'unknown') return activity;
     return 'unknown';
   }
   return 'missing';
@@ -480,7 +483,7 @@ function updateChrome() {
     banner.hidden = false;
   } else if (!S.agent.connected) {
     banner.className = 'banner';
-    banner.textContent = 'The agent on the agent is disconnected. The tree is read-only and live session state is unknown.';
+    banner.textContent = 'The agent on the session host is disconnected. The tree is read-only and live session state is unknown.';
     banner.hidden = false;
   } else {
     banner.hidden = true;
@@ -488,6 +491,7 @@ function updateChrome() {
 
   $('#new-folder-root').disabled = down;
   $('#new-session-root').disabled = down;
+  $('#hibernate-idle').disabled = down;
   $('#upload-button').disabled = down || !S.active;
   $('#files-button').disabled = !S.active;
 }
@@ -932,8 +936,22 @@ function openRowMenu(row, anchor) {
 
 /* ---------- terminal frame ---------- */
 
-function openSession(name) {
+async function openSession(name) {
   if (!name) return;
+  const target = sessionByName(name);
+  if (target?.sleeping) {
+    S.waking.add(name);
+    render();
+  }
+  try {
+    const result = await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/open', {});
+    if (result?.wake?.wakeMs) toast('Woke ' + name + ' in ' + fmtSecs(result.wake.wakeMs / 1000) + '.');
+  } catch (e) {
+    toast(errText(e), true);
+    return;
+  } finally {
+    S.waking.delete(name);
+  }
   $('#files-drawer').hidden = true;
   freezeFrame(S.active);
   S.active = name;
@@ -943,6 +961,7 @@ function openSession(name) {
   render();
   syncFrames();
   if (isPhone()) setSidebarCollapsed(true);
+  await refreshState(true);
 }
 
 function closeSession(name) {
@@ -1213,7 +1232,7 @@ function hideUploadOverlay() {
 
 async function uploadItems(items) {
   if (!S.active) throw new Error('Open a session before uploading.');
-  if (!canMutate()) throw new Error('The agent on the agent is disconnected.');
+  if (!canMutate()) throw new Error('The agent on the session host is disconnected.');
   if (!items.length) return;
   for (const item of items) {
     if (item.file.size > MAX_UPLOAD_BYTES) throw new Error(item.file.name + ' exceeds the 2 GB upload limit.');
@@ -1342,7 +1361,7 @@ function hasFiles(ev) {
 function dropBlocker() {
   if (!S.authed) return { title: 'Log in to upload', detail: 'Files can be dropped after you log in.' };
   if (!S.active) return { title: 'No session is open', detail: 'Open a session in the sidebar, then drop the files on the page.' };
-  if (!canMutate()) return { title: 'The agent on the agent is disconnected', detail: 'Uploads need the agent. Drop the files again when it reconnects.' };
+  if (!canMutate()) return { title: 'The agent on the session host is disconnected', detail: 'Uploads need the agent. Drop the files again when it reconnects.' };
   return null;
 }
 
@@ -1353,7 +1372,7 @@ function showDropOverlay() {
   $('#drop-title').textContent = blocked ? blocked.title : 'Drop to upload to ' + S.active;
   $('#drop-detail').textContent = blocked
     ? blocked.detail
-    : 'Files and folders go to the agent file area' + S.active + '/in/ on the agent. Their paths are typed at the prompt without Enter.';
+    : 'Files and folders go to this session\'s upload folder on the session host. Their paths are typed at the prompt without Enter.';
   el.hidden = false;
   document.body.classList.add('file-dragging');
   fileDrag.shown = true;
@@ -1914,6 +1933,7 @@ function menuLeaf(anchor, n) {
   const st = liveState(n.session_name);
   openMenu(anchor, n.session_name, [
     { label: 'Open terminal', run: function () { openSession(n.session_name); } },
+    st === 'idle' ? { label: 'Hibernate', disabled: ro, run: function () { dlgHibernateOne(n.session_name); } } : null,
     st === 'missing' ? { label: 'Create session', disabled: ro, run: function () { dlgRecreate(n); } } : null,
     st === 'idle' ? { label: 'Rename session', disabled: ro, run: function () { dlgRenameSession(n.session_name); } } : null,
     { label: 'Move to folder', disabled: ro, run: function () { dlgMove(n); } },
@@ -1926,6 +1946,7 @@ function menuUnfiled(anchor, name) {
   const st = liveState(name);
   openMenu(anchor, name, [
     { label: 'Open terminal', run: function () { openSession(name); } },
+    st === 'idle' ? { label: 'Hibernate', disabled: ro, run: function () { dlgHibernateOne(name); } } : null,
     st === 'idle' ? { label: 'Rename session', disabled: ro, run: function () { dlgRenameSession(name); } } : null,
     { label: 'File into folder', disabled: ro, run: function () { dlgAdopt(name); } },
     { label: 'Delete session', danger: true, disabled: ro, run: function () { dlgDeleteUnfiled(name); } }
@@ -2091,7 +2112,7 @@ function dlgDeleteFolder(n) {
     title: 'Delete folder ' + n.name,
     body: [
       h('p', { class: 'modal-text' }, empty ? 'This folder is empty.' : 'This folder contains ' + counts + '.'),
-      empty ? null : h('p', { class: 'hint' }, 'Move contents up keeps the sessions and puts everything in ' + pathOf(n.parent_id) + '. Delete contents destroys the real zellij sessions on the agent.')
+      empty ? null : h('p', { class: 'hint' }, 'Move contents up keeps the sessions and puts everything in ' + pathOf(n.parent_id) + '. Delete contents destroys the real zellij sessions on the session host.')
     ],
     extra: empty ? [
       { label: 'Delete folder', danger: true, run: async function () {
@@ -2212,7 +2233,7 @@ function dlgDeleteLeaf(n) {
   modal({
     title: 'Delete session ' + n.session_name,
     body: [
-      h('p', { class: 'modal-text' }, 'This destroys the zellij session ' + n.session_name + ' on the agent and removes the leaf from the tree.'),
+      h('p', { class: 'modal-text' }, 'This destroys the zellij session ' + n.session_name + ' on the session host and removes the leaf from the tree.'),
       h('p', { class: 'hint' }, 'Anything running in its panes is stopped.')
     ],
     extra: [{ label: 'Delete session', danger: true, run: async function () {
@@ -2227,7 +2248,7 @@ function dlgDeleteUnfiled(name) {
   modal({
     title: 'Delete session ' + name,
     body: [
-      h('p', { class: 'modal-text' }, 'This destroys the zellij session ' + name + ' on the agent.'),
+      h('p', { class: 'modal-text' }, 'This destroys the zellij session ' + name + ' on the session host.'),
       h('p', { class: 'hint' }, 'Anything running in its panes is stopped.')
     ],
     extra: [{ label: 'Delete session', danger: true, run: async function () {
@@ -2243,14 +2264,67 @@ function dlgDeleteUnfiled(name) {
   });
 }
 
+function hibernatePreviewRows(rows) {
+  if (!rows.length) return h('p', { class: 'modal-text' }, 'No sessions meet the hibernation conditions.');
+  const list = h('div', { class: 'pick-list', 'aria-label': 'Sessions to hibernate' });
+  for (const row of rows) {
+    list.append(h('div', { class: 'pick' },
+      h('strong', null, row.name),
+      h('div', { class: 'hint' }, (row.lastActivityAt ? fmtAge(row.lastActivityAt) : 'No recorded activity') + '. ' + row.reason)
+    ));
+  }
+  return list;
+}
+
+async function dlgHibernateOne(name) {
+  let preview;
+  try { preview = await api('GET', '/api/sessions/hibernate-preview'); }
+  catch (e) { toast(errText(e), true); return; }
+  const candidate = (preview.candidates || []).find(function (row) { return row.name === name; });
+  if (!candidate) {
+    const excluded = (preview.excluded || []).find(function (row) { return row.name === name; });
+    toast(name + ' cannot hibernate: ' + (excluded?.reason || 'state changed') + '.', true);
+    return;
+  }
+  modal({
+    title: 'Hibernate ' + name,
+    body: [h('p', { class: 'modal-text' }, 'This stops the session while preserving its Claude conversation for wake.'), hibernatePreviewRows([candidate])],
+    extra: [{ label: 'Hibernate', run: async function () {
+      await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/hibernate', {});
+      closeSession(name);
+      await refreshState(true);
+    } }]
+  });
+}
+
+async function dlgHibernateIdle() {
+  let preview;
+  try { preview = await api('GET', '/api/sessions/hibernate-preview'); }
+  catch (e) { toast(errText(e), true); return; }
+  const candidates = preview.candidates || [];
+  modal({
+    title: 'Hibernate idle sessions',
+    body: [
+      h('p', { class: 'modal-text' }, candidates.length ? 'These sessions will be hibernated. Their conversations are preserved for wake.' : 'No sessions meet the hibernation conditions.'),
+      hibernatePreviewRows(candidates)
+    ],
+    extra: candidates.length ? [{ label: 'Hibernate ' + candidates.length + (candidates.length === 1 ? ' session' : ' sessions'), run: async function () {
+      const result = await api('POST', '/api/sessions/hibernate-idle', { names: candidates.map(function (row) { return row.name; }) });
+      for (const item of result.hibernated || []) closeSession(item.name);
+      await refreshState(true);
+      if (result.skipped?.length) toast(result.skipped.length + ' session' + (result.skipped.length === 1 ? ' was' : 's were') + ' skipped because its state changed.');
+    } }] : []
+  });
+}
+
 function dlgRecreate(n) {
   modal({
     title: 'Create session ' + n.session_name,
     body: [
-      h('p', { class: 'modal-text' }, 'This session is in the tree but is not running on the agent. It will be created with its stored settings.'),
+      h('p', { class: 'modal-text' }, 'This session is in the tree but is not running on the session host. It will be created with its stored settings.'),
       kv('Name', n.session_name),
       kv('Panes', String(n.panes || 1)),
-      kv('Directory', n.workdir || 'your working directory'),
+      kv('Directory', n.workdir || '/workspace'),
       kv('Resume', n.resume_sid || 'none')
     ],
     submitLabel: 'Create session',
@@ -2258,7 +2332,7 @@ function dlgRecreate(n) {
       await api('POST', '/api/sessions', {
         name: n.session_name,
         panes: Number(n.panes) || 1,
-        workdir: n.workdir || '',
+        workdir: n.workdir || '/workspace',
         resume_sid: n.resume_sid || null,
         parent_id: n.parent_id || null
       });
@@ -2321,7 +2395,7 @@ function transcriptSection(state) {
 
 function dlgNewSession(parentId) {
   const nameInput = h('input', { class: 'inp', type: 'text', maxlength: '64', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
-  const dirInput = h('input', { class: 'inp', type: 'text', placeholder: 'Agent default', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+  const dirInput = h('input', { class: 'inp', type: 'text', value: '/workspace', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Pane count' });
   const resume = { sid: null };
   let panes = 1;
@@ -2354,8 +2428,8 @@ function dlgNewSession(parentId) {
     onSubmit: async function () {
       const name = nameInput.value.trim();
       if (!NAME_RE.test(name)) throw new Error('Use letters, numbers, dot, dash or underscore, 1 to 64 characters.');
-      const workdir = dirInput.value.trim();
-      if (workdir && workdir.charAt(0) !== '/') throw new Error('The working directory must be an absolute path.');
+      const workdir = dirInput.value.trim() || '/workspace';
+      if (workdir.charAt(0) !== '/') throw new Error('The working directory must be an absolute path.');
       await api('POST', '/api/sessions', {
         name: name,
         panes: panes,
@@ -2585,6 +2659,7 @@ function endDrag() {
 
 $('#new-folder-root').addEventListener('click', function () { dlgNewFolder(null); });
 $('#new-session-root').addEventListener('click', function () { dlgNewSession(null); });
+$('#hibernate-idle').addEventListener('click', dlgHibernateIdle);
 
 (async function boot() {
   let authed = null;

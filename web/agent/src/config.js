@@ -21,7 +21,10 @@ export const config = {
   webHost: env.MCW_WEB_HOST || '127.0.0.1',
   webPort: Number(env.MCW_WEB_PORT || 8082),
   maxclaudeCfg: env.MCW_MAXCLAUDE_CFG || path.join(configHome, 'maxclaude'),
+  maxagentCfg: env.MCW_MAXAGENT_CFG || path.join(configHome, 'maxagent'),
+  maxclaudeBin: env.MCW_MAXCLAUDE_BIN || path.join(homeDir, '.local', 'bin', 'maxclaude'),
   transcriptDir: env.MCW_TRANSCRIPT_DIR || path.join(claudeDir, 'projects'),
+  claudeConfigDir: claudeDir,
   defaultWorkdir: env.MCW_DEFAULT_WORKDIR || homeDir,
   agentName: env.MCW_AGENT_NAME || os.hostname(),
   runtimeDir: env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 0}`,
@@ -31,7 +34,13 @@ export const config = {
   createWaitMs: 20000,
   webWatchMs: 30000,
   statusWatchMs: 1000,
+  autoHibernateHours: Number(env.MCW_AUTO_HIBERNATE_HOURS || 0),
+  autoHibernateWatchMs: 10 * 60 * 1000,
 };
+
+if (!Number.isFinite(config.autoHibernateHours) || config.autoHibernateHours < 0) {
+  throw new Error('MCW_AUTO_HIBERNATE_HOURS must be a non-negative number');
+}
 
 export const webOrigin = `http://${config.webHost}:${config.webPort}`;
 export const webWsOrigin = `ws://${config.webHost}:${config.webPort}`;

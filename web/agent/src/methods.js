@@ -2,7 +2,7 @@ import os from 'node:os';
 import { config, webOrigin } from './config.js';
 import { run } from './exec.js';
 import { RpcError } from './errors.js';
-import { listSessions, createSession, deleteSession, renameSession } from './sessions.js';
+import { listSessions, createSession, deleteSession, renameSession, hibernateSession, hibernateCandidates, wakeSession, reserveSessionViewer, releaseSessionViewer } from './sessions.js';
 import { listTranscripts } from './transcripts.js';
 import { webStatus, tokenName } from './zellijweb.js';
 import { readWebSharing } from './zellijconfig.js';
@@ -30,6 +30,11 @@ const table = {
   'sessions.create': (params) => createSession(params || {}),
   'sessions.rename': (params) => renameSession(params || {}),
   'sessions.delete': (params) => deleteSession(params || {}),
+  'sessions.hibernateCandidates': (params) => hibernateCandidates(params || {}),
+  'sessions.hibernate': (params) => hibernateSession(params || {}),
+  'sessions.wake': (params) => wakeSession(params || {}),
+  'sessions.reserveViewer': (params) => reserveSessionViewer(params || {}),
+  'sessions.releaseViewer': (params) => releaseSessionViewer(params || {}),
   'transcripts.list': (params) => listTranscripts(params || {}),
   'files.stat': (params) => statPaths(params || {}),
 };

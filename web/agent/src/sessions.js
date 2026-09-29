@@ -4,12 +4,17 @@ import { config } from './config.js';
 import { run, runOrThrow, stripAnsi } from './exec.js';
 import { RpcError } from './errors.js';
 import { log } from './log.js';
-import { collectSessionActivity, readLiveClaudePanes } from './status.js';
+import { collectSessionActivity, hiddenSessionActivity, readLiveClaudePanes, readSessionProcessSnapshot } from './status.js';
+import { viewerCount } from './viewers.js';
+import { readWebSharing } from './zellijconfig.js';
+import { webStatus } from './zellijweb.js';
+import { reserveViewer, releaseViewerLease } from './viewers.js';
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const mutations = new Map();
+const resumableCache = new Map();
 
 export function parseCreatedAt(created, now = Date.now()) {
   const match = /^Created\s+(.+?)\s+ago$/i.exec(`${created}`.trim());
@@ -77,14 +82,186 @@ export async function listSessions() {
       current: /\(current\)/i.test(rest),
     });
   }
-  const activity = collectSessionActivity(sessions.map((session) => session.name));
+  const processSnapshot = readSessionProcessSnapshot();
+  const activity = collectSessionActivity(sessions.map((session) => session.name), { snapshot: processSnapshot });
+  const operatorClients = attachedOperatorSessions(sessions.map((session) => session.name));
   for (const session of sessions) {
     session.activity = activity[session.name]?.state || 'absent';
     session.activityUpdatedAt = activity[session.name]?.updatedAt || 0;
     session.lastResponseAt = activity[session.name]?.lastResponseAt || 0;
     session.lastActivityAt = activity[session.name]?.lastActivityAt || 0;
+    session.descendantTaskCount = activity[session.name]?.descendantTaskCount || 0;
+    session.sleeping = false;
+    session.viewers = viewerCount(session.name);
+    session.conversationIds = [...liveConversationIds(session.name, processSnapshot.claudePanes)];
+    session.conversationCount = session.conversationIds.length;
+    session.resumable = session.conversationCount === 1 && await isResumableSession(session.name);
+    session.operatorActive = operatorClients.ambiguous || operatorClients.sessions.has(session.name) || session.current;
   }
+  const liveNames = new Set(sessions.map((session) => session.name));
+  sessions.push(...hiddenSessionRows().filter((session) => !liveNames.has(session.name)));
   return { sessions };
+}
+
+async function isResumableSession(name) {
+  const files = sessionFiles(name);
+  if (!fs.existsSync(files.env) || !fs.existsSync(files.panes)) return false;
+  const cached = resumableCache.get(name);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const escaped = await systemdEscape(name);
+  const unit = `maxclaude-named@${escaped}.service`;
+  const result = await run('systemctl', ['--user', 'show', unit, '--property=LoadState', '--property=ActiveState', '--value'], { timeout: 10000 });
+  const value = result.code === 0 && isActiveMaxclaudeUnit(result.stdout);
+  resumableCache.set(name, { value, expiresAt: Date.now() + 60000 });
+  return value;
+}
+
+export function isActiveMaxclaudeUnit(output) {
+  const [loadState, activeState] = String(output).trim().split(/\s+/);
+  return loadState === 'loaded' && activeState === 'active';
+}
+
+export function hibernateEligibility(session, { automatic = false, now = Date.now() } = {}) {
+  if (session.sleeping) return { eligible: false, reason: 'already sleeping' };
+  if (session.current || session.operatorActive) return { eligible: false, reason: 'operator is working in this session' };
+  if ((session.conversationCount || 0) > 1) return { eligible: false, reason: 'multiple live Claude conversations cannot be resumed safely' };
+  if ((session.conversationCount || 0) === 0) return { eligible: false, reason: 'no live Claude conversation id is available to preserve' };
+  if (!session.resumable) return { eligible: false, reason: 'not a resumable maxclaude session' };
+  if (session.activity !== 'idle') return { eligible: false, reason: `session is ${session.activity}` };
+  if ((session.descendantTaskCount || 0) > 0) return { eligible: false, reason: 'live descendant task process' };
+  if ((session.viewers || session.viewerCount || 0) > 0) return { eligible: false, reason: 'browser client is viewing it' };
+  if (automatic) {
+    const cutoff = config.autoHibernateHours * 3600000;
+    if (!cutoff) return { eligible: false, reason: 'automatic hibernation is disabled' };
+    if (!session.lastActivityAt) return { eligible: false, reason: 'last real activity is unknown' };
+    if (now - session.lastActivityAt < cutoff) return { eligible: false, reason: 'last real activity is below the configured age' };
+  }
+  return { eligible: true, reason: automatic ? 'idle, resumable, unviewed, no live task, and past the configured inactivity age' : 'idle, resumable, unviewed, and no live task' };
+}
+
+export async function hibernateCandidates({ automatic = false } = {}) {
+  const { sessions } = await listSessions();
+  const candidates = [];
+  const excluded = [];
+  for (const session of sessions) {
+    const eligibility = hibernateEligibility(session, { automatic });
+    const row = {
+      name: session.name,
+      lastActivityAt: session.lastActivityAt,
+      reason: eligibility.reason,
+      activity: session.activity,
+      viewerCount: session.viewers || 0,
+      resumable: session.resumable === true,
+      operatorActive: session.operatorActive === true,
+      descendantTaskCount: session.descendantTaskCount || 0,
+      conversationCount: session.conversationCount || 0,
+    };
+    (eligibility.eligible ? candidates : excluded).push(row);
+  }
+  return { candidates, excluded };
+}
+
+export async function hibernateSession(params = {}) {
+  const name = validateName(params.name);
+  const automatic = params.automatic === true;
+  return withSessionLocks([name], async () => {
+    const { sessions } = await listSessions();
+    const session = sessions.find((item) => item.name === name);
+    if (!session) throw new RpcError('not_found', `session ${name} is not known`, { name });
+    const eligibility = hibernateEligibility(session, { automatic });
+    if (!eligibility.eligible) throw new RpcError('conflict', `session ${name} cannot be hibernated: ${eligibility.reason}`, { name, reason: eligibility.reason });
+    await runOrThrow(config.maxclaudeBin, ['hide', name], { timeout: 60000 });
+    recordHiddenActivity(name, session.lastActivityAt, session.createdAt);
+    resumableCache.delete(name);
+    const sleeping = (await listSessions()).sessions.find((item) => item.name === name);
+    if (!sleeping?.sleeping) throw new RpcError('internal', `session ${name} did not enter sleeping state`, { name });
+    log.info(automatic ? 'session automatically hibernated' : 'session hibernated', {
+      name, reason: eligibility.reason, lastActivityAt: session.lastActivityAt,
+    });
+    return { name, sleeping: true, lastActivityAt: sleeping.lastActivityAt, reason: eligibility.reason };
+  });
+}
+
+export async function wakeSession(params = {}) {
+  const name = validateName(params.name);
+  return withSessionLocks([name], async () => {
+    const hidden = hiddenSessionRows().find((session) => session.name === name);
+    if (!hidden) throw new RpcError('conflict', `session ${name} is not sleeping`, { name });
+    if (!hidden.resumable) throw new RpcError('conflict', `session ${name} has no recorded Claude conversation`, { name });
+    const sessionState = readEnvFile(sessionFiles(name).env) || {};
+    const resumeSid = sessionState.MAXCLAUDE_RESUME_SID;
+    const started = Date.now();
+    await startHiddenUnit(name);
+    resumableCache.delete(name);
+    const deadline = Date.now() + config.createWaitMs;
+    while (Date.now() < deadline) {
+      const web = await webStatus();
+      if (await isLive(name) && readWebSharing() === 'on' && web.online && wakeCommandMatches(name, resumeSid)) {
+        const wakeMs = Date.now() - started;
+        log.info('session woke', { name, wakeMs });
+        return { name, waking: false, wakeMs };
+      }
+      await sleep(250);
+    }
+    throw new RpcError('internal', `session ${name} did not return after its unit started`, { name });
+  });
+}
+
+export function wakeStartPlan(name, metadata, escaped) {
+  const expectedUnit = `maxclaude-named@${escaped}.service`;
+  if (metadata?.MAXAGENT_UNIT !== expectedUnit) {
+    throw new RpcError('conflict', `hidden session ${name} does not record the expected maxclaude unit`, {
+      name, expectedUnit, recordedUnit: metadata?.MAXAGENT_UNIT || null,
+    });
+  }
+  return { command: 'systemctl', args: ['--user', 'start', expectedUnit], unit: expectedUnit };
+}
+
+async function startHiddenUnit(name) {
+  const file = maxagentMetaFile(name);
+  const metadata = readEnvFile(file);
+  if (!metadata?.MAXAGENT_HIDDEN || metadata.MAXAGENT_HIDDEN !== '1') {
+    throw new RpcError('conflict', `session ${name} is not marked hidden`, { name });
+  }
+  const plan = wakeStartPlan(name, metadata, await systemdEscape(name));
+  await runOrThrow(plan.command, plan.args, { timeout: 60000 });
+  delete metadata.MAXAGENT_HIDDEN;
+  writeMetadata(file, metadata);
+}
+
+export function wakeCommandMatches(name, resumeSid, panes = readLiveClaudePanes()) {
+  if (!resumeSid) return false;
+  const remote = `--remote-control=${name}`;
+  return [...panes.values()]
+    .filter((pane) => pane.session === name)
+    .some((pane) => (pane.commands || []).some((command) => {
+      const resumeAt = command.indexOf('--resume');
+      return command.includes(remote) && resumeAt >= 0 && command[resumeAt + 1] === resumeSid;
+    }));
+}
+
+export async function runAutomaticHibernate() {
+  if (!config.autoHibernateHours) return { candidates: [], hibernated: [] };
+  const preview = await hibernateCandidates({ automatic: true });
+  const hibernated = [];
+  for (const candidate of preview.candidates) {
+    try {
+      hibernated.push(await hibernateSession({ name: candidate.name, automatic: true }));
+    } catch (err) {
+      log.warn('automatic hibernation skipped after recheck', { name: candidate.name, error: String(err.message) });
+    }
+  }
+  return { candidates: preview.candidates, hibernated };
+}
+
+export function reserveSessionViewer(params = {}) {
+  const name = validateName(params.name);
+  return { name, leaseId: reserveViewer(name) };
+}
+
+export function releaseSessionViewer(params = {}) {
+  if (typeof params.leaseId !== 'string') throw new RpcError('bad_request', 'leaseId is required');
+  return { released: releaseViewerLease(params.leaseId) };
 }
 
 export async function isLive(name) {
@@ -134,6 +311,123 @@ function sessionFiles(name) {
     env: path.join(config.maxclaudeCfg, 'sessions', `${name}.env`),
     panes: path.join(config.maxclaudeCfg, `${name}.panes`),
   };
+}
+
+function maxagentMetaFile(name) {
+  return path.join(config.maxagentCfg, 'sessions', `${name}.env`);
+}
+
+function readEnvFile(file) {
+  try {
+    const result = {};
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const index = line.indexOf('=');
+      if (index > 0) result[line.slice(0, index)] = line.slice(index + 1);
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function liveConversationIds(name, panes = readLiveClaudePanes()) {
+  const ids = new Set();
+  for (const pane of panes.values()) {
+    if (pane.session !== name) continue;
+    for (const pid of pane.pids || []) {
+      try {
+        const value = JSON.parse(fs.readFileSync(path.join(config.claudeConfigDir, 'sessions', `${pid}.json`), 'utf8'));
+        if (typeof value.sessionId === 'string' && UUID_RE.test(value.sessionId)) ids.add(value.sessionId);
+      } catch { /* a process can exit while its conversation record is read */ }
+    }
+  }
+  return ids;
+}
+
+function hiddenSessionRows() {
+  let files = [];
+  try { files = fs.readdirSync(path.join(config.maxagentCfg, 'sessions')); } catch { return []; }
+  return files.filter((file) => file.endsWith('.env')).flatMap((file) => {
+    const name = file.slice(0, -4);
+    if (!NAME_RE.test(name)) return [];
+    const meta = readEnvFile(maxagentMetaFile(name));
+    if (meta?.MAXAGENT_HIDDEN !== '1') return [];
+    const session = readEnvFile(sessionFiles(name).env) || {};
+    const activity = hiddenSessionActivity({ workdir: session.MAXCLAUDE_WORKDIR, resumeSid: session.MAXCLAUDE_RESUME_SID });
+    const recordedActivityAt = Number(meta.MCW_LAST_ACTIVITY_AT) || 0;
+    const createdAt = Number(meta.MCW_CREATED_AT) || 0;
+    return [{ name, created: '', createdAt, exited: false, current: false, sleeping: true,
+      resumable: Boolean(session.MAXCLAUDE_WORKDIR && session.MAXCLAUDE_RESUME_SID), operatorActive: false,
+      activity: 'sleeping', activityUpdatedAt: recordedActivityAt || activity.lastActivityAt,
+      lastResponseAt: activity.lastResponseAt, lastActivityAt: recordedActivityAt || activity.lastActivityAt,
+      descendantTaskCount: 0, viewers: 0, conversationCount: 1 }];
+  });
+}
+
+function recordHiddenActivity(name, lastActivityAt, createdAt) {
+  const file = maxagentMetaFile(name);
+  const meta = readEnvFile(file);
+  if (!meta) throw new RpcError('internal', `hidden metadata is missing for ${name}`, { name, file });
+  meta.MCW_LAST_ACTIVITY_AT = String(Math.max(0, Number(lastActivityAt) || 0));
+  meta.MCW_CREATED_AT = String(Math.max(0, Number(createdAt) || 0));
+  writeMetadata(file, meta);
+}
+
+function writeMetadata(file, metadata) {
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, Object.entries(metadata).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+
+export function parseZellijClientCommand(command, envSession = '', knownNames = []) {
+  if (envSession && NAME_RE.test(envSession)) return { names: [envSession], ambiguous: false };
+  const attach = Math.max(command.lastIndexOf('attach'), command.lastIndexOf('a'));
+  const watch = Math.max(command.lastIndexOf('watch'), command.lastIndexOf('w'));
+  const verb = Math.max(attach, watch);
+  if (verb < 0) return { names: [], ambiguous: true };
+  if (command.indexOf('--index', verb + 1) >= 0) return { names: [], ambiguous: true };
+  const takesValue = new Set(['--ca-cert', '--token']);
+  const names = [];
+  for (let index = verb + 1; index < command.length; index += 1) {
+    const arg = command[index];
+    if (takesValue.has(arg)) { index += 1; continue; }
+    if (!arg.startsWith('-')) names.push(arg);
+  }
+  const name = names.at(-1);
+  if (!name || !knownNames.includes(name)) return { names: [], ambiguous: true };
+  return { names: [name], ambiguous: false };
+}
+
+export function isZellijServerCommand(command) {
+  return command.includes('--server');
+}
+
+export function isZellijClientCommand(command) {
+  return command.includes('attach') || command.includes('a') || command.includes('watch') || command.includes('w');
+}
+
+function attachedOperatorSessions(knownNames = []) {
+  const sessions = new Set();
+  let ambiguous = false;
+  let entries = [];
+  try { entries = fs.readdirSync('/proc', { withFileTypes: true }); } catch { return { sessions, ambiguous: true }; }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    let command = [];
+    try { command = fs.readFileSync(path.join('/proc', entry.name, 'cmdline')).toString('utf8').split('\0').filter(Boolean); } catch { continue; }
+    if (path.basename(command[0] || '') !== path.basename(config.zellijBin)) continue;
+    if (isZellijServerCommand(command)) continue;
+    if (!isZellijClientCommand(command)) continue;
+    let envSession = '';
+    try {
+      const env = fs.readFileSync(path.join('/proc', entry.name, 'environ')).toString('utf8').split('\0');
+      envSession = env.find((value) => value.startsWith('ZELLIJ_SESSION_NAME='))?.slice('ZELLIJ_SESSION_NAME='.length) || '';
+    } catch { /* the client can exit while its environment is read */ }
+    const parsed = parseZellijClientCommand(command, envSession, knownNames);
+    for (const name of parsed.names) sessions.add(name);
+    ambiguous ||= parsed.ambiguous;
+  }
+  return { sessions, ambiguous };
 }
 
 async function terminalPaneIds(name) {
@@ -253,12 +547,12 @@ async function createSessionLocked(params, name) {
     throw new RpcError('bad_request', 'panes must be an integer 1 to 4', { panes: params.panes });
   }
 
-  const workdir = oneLine(params.workdir, 'workdir') || config.defaultWorkdir;
+  const workdir = oneLine(params.workdir, 'workdir') || '/workspace';
   if (!path.isAbsolute(workdir)) {
     throw new RpcError('bad_request', 'workdir must be an absolute path', { workdir });
   }
   if (!fs.existsSync(workdir) || !fs.statSync(workdir).isDirectory()) {
-    throw new RpcError('not_found', 'workdir does not exist on this agent host', { workdir });
+    throw new RpcError('not_found', 'workdir does not exist on the session host', { workdir });
   }
 
   const resumeSid = oneLine(params.resumeSid, 'resumeSid');

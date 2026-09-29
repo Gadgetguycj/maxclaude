@@ -8,8 +8,7 @@ WorkingDirectory=@INSTALL_ROOT@
 ExecStart=/usr/bin/env node @INSTALL_ROOT@/src/index.js
 Restart=always
 RestartSec=5
-# The zellij web server is daemonized by this service and must outlive its restarts.
-KillMode=process
+KillMode=control-group
 EnvironmentFile=-@ENV_FILE@
 Environment=NODE_ENV=production
 StandardOutput=journal

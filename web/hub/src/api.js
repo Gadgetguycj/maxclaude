@@ -298,16 +298,72 @@ export function createApi(tunnel) {
   router.post('/sessions/:name/open', async (req, res) => {
     try {
       const name = cleanSessionName(req.params.name);
-      const sessions = await liveSessions();
+      let sessions = await liveSessions();
       if (sessions === null) throw new TunnelError('agent_disconnected', 'the agent is not connected');
-      if (!sessions.some((session) => session.name === name && !session.exited)) {
+      const target = sessions.find((session) => session.name === name && !session.exited);
+      if (!target) {
         throw new TreeError(404, 'not_found', `session ${name} is not running`);
+      }
+      const lease = await tunnel.rpc('sessions.reserveViewer', { name });
+      let wake = null;
+      try {
+        if (target.sleeping) {
+          wake = await tunnel.rpc('sessions.wake', { name });
+          sessionsInFlight = null;
+          sessions = await liveSessions();
+        }
+      } catch (err) {
+        await tunnel.rpc('sessions.releaseViewer', { leaseId: lease.leaseId }).catch(() => {});
+        throw err;
       }
       return res.json({
         ok: true,
         session_name: name,
+        wake,
         recents: recentSessions(sessions, recentLimit(), tunnel.status().sessionStatus)
       });
+    } catch (err) {
+      return fail(res, err);
+    }
+  });
+
+  router.get('/sessions/hibernate-preview', async (req, res) => {
+    try {
+      const automatic = req.query.automatic === '1';
+      return res.json(await tunnel.rpc('sessions.hibernateCandidates', { automatic }));
+    } catch (err) {
+      return fail(res, err);
+    }
+  });
+
+  router.post('/sessions/:name/hibernate', async (req, res) => {
+    try {
+      const name = cleanSessionName(req.params.name);
+      const result = await tunnel.rpc('sessions.hibernate', { name, automatic: false });
+      sessionsInFlight = null;
+      return res.json(result);
+    } catch (err) {
+      return fail(res, err);
+    }
+  });
+
+  router.post('/sessions/hibernate-idle', async (req, res) => {
+    try {
+      const names = Array.isArray(req.body?.names) ? req.body.names : null;
+      if (!names || !names.length || names.some((name) => typeof name !== 'string')) {
+        throw new TreeError(400, 'bad_request', 'names must contain the sessions displayed in the confirmation');
+      }
+      const results = [];
+      const skipped = [];
+      for (const name of [...new Set(names)]) {
+        try {
+          results.push(await tunnel.rpc('sessions.hibernate', { name, automatic: false }));
+        } catch (err) {
+          skipped.push({ name, reason: err.message });
+        }
+      }
+      sessionsInFlight = null;
+      return res.json({ hibernated: results, skipped });
     } catch (err) {
       return fail(res, err);
     }

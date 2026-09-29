@@ -5,7 +5,7 @@ import { log } from './log.js';
 import { ensureWebSharing } from './zellijconfig.js';
 import { ensureWebServer, ensureToken, login, webStatus } from './zellijweb.js';
 import { Tunnel } from './tunnel.js';
-import { listSessions } from './sessions.js';
+import { listSessions, runAutomaticHibernate } from './sessions.js';
 
 function readSecret() {
   let raw;
@@ -55,6 +55,10 @@ async function main() {
         updatedAt: session.activityUpdatedAt,
         lastResponseAt: session.lastResponseAt,
         lastActivityAt: session.lastActivityAt,
+        descendantTaskCount: session.descendantTaskCount,
+        viewerCount: session.viewers,
+        resumable: session.resumable,
+        operatorActive: session.operatorActive,
       }]));
       const changed = [...current].some(([name, status]) => (
         priorStatus.get(name)?.state !== status.state
@@ -93,10 +97,24 @@ async function main() {
     }
   }, config.webWatchMs);
 
+  let hibernatePolling = false;
+  const hibernateWatch = setInterval(async () => {
+    if (hibernatePolling || !config.autoHibernateHours) return;
+    hibernatePolling = true;
+    try {
+      await runAutomaticHibernate();
+    } catch (err) {
+      log.warn('automatic hibernation scan failed', { error: String(err.message) });
+    } finally {
+      hibernatePolling = false;
+    }
+  }, config.autoHibernateWatchMs);
+
   const shutdown = (sig) => {
     log.info('shutting down', { signal: sig });
     clearInterval(watch);
     clearInterval(statusWatch);
+    clearInterval(hibernateWatch);
     tunnel.stop();
     setTimeout(() => process.exit(0), 500).unref();
   };

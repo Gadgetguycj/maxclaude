@@ -6,6 +6,7 @@ import { toWireError } from './errors.js';
 import { sendableCloseCode, clampCloseReason } from './wsclose.js';
 import { log } from './log.js';
 import { listSessionNames, terminalSocketSession } from './sessions.js';
+import { convertViewerLease, removeViewer } from './viewers.js';
 
 const STRIP = new Set([
   'cookie', 'authorization', 'host', 'connection', 'upgrade', 'keep-alive',
@@ -25,7 +26,7 @@ export class WsProxy {
       this.link.sendJson({ t: 'ws.err', id, error: { code: 'conflict', message: 'channel id is already open' } });
       return;
     }
-    const entry = { id, socket: null, closed: false, queue: [] };
+    const entry = { id, socket: null, closed: false, queue: [], viewer: null };
     this.open.set(id, entry);
 
     let cookie;
@@ -63,6 +64,10 @@ export class WsProxy {
       if (entry.closed) {
         this.open.delete(id);
         return;
+      }
+      if (target) {
+        entry.viewer = target;
+        convertViewerLease(target);
       }
     }
 
@@ -102,12 +107,14 @@ export class WsProxy {
           error: { code: 'upstream_unavailable', message: `${err.code || 'error'}: ${err.message}` },
         });
         this.open.delete(id);
+        removeViewer(entry.viewer);
       }
     });
 
     socket.on('close', (code, reason) => {
       if (!this.open.has(id)) return;
       this.open.delete(id);
+      removeViewer(entry.viewer);
       this.link.sendJson({ t: 'ws.close', id, code: code || 1000, reason: reason ? reason.toString() : '' });
     });
   }
@@ -127,6 +134,7 @@ export class WsProxy {
     if (!entry) return;
     entry.closed = true;
     this.open.delete(entry.id);
+    removeViewer(entry.viewer);
     if (entry.socket) {
       try {
         entry.socket.close(sendableCloseCode(msg.code, 1000), clampCloseReason(msg.reason));
@@ -140,6 +148,7 @@ export class WsProxy {
   closeAll() {
     for (const entry of this.open.values()) {
       entry.closed = true;
+      removeViewer(entry.viewer);
       if (entry.socket) {
         try { entry.socket.close(1001, 'tunnel down'); } catch { entry.socket.terminate(); }
       }

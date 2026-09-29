@@ -225,6 +225,27 @@ MCW_AGENT_SECRET='replace-with-the-hub-agent-secret' \
 The flag does not change a normal installation. Follow the configuration and
 privacy guidance in [web/README.md](web/README.md) before starting the agent.
 
+## Temporary Browser Reaper
+
+The installer adds a user timer that can close abandoned headless Chrome
+processes created with a temporary profile under `/tmp`. It only considers
+browser process trees older than `MAXCLAUDE_BROWSER_MAX_HOURS`. The default is
+`0`, which disables the reaper.
+
+Set a positive value in `~/.config/maxagent/browser-reaper.env`, then restart
+the timer:
+
+```bash
+# ~/.config/maxagent/browser-reaper.env
+MAXCLAUDE_BROWSER_MAX_HOURS=36
+
+systemctl --user restart maxclaude-browser-reaper.timer
+```
+
+Fractional hours are accepted for a short test. The reaper never closes a
+browser with a persistent profile outside `/tmp`. Its actions are recorded by
+the `maxclaude-browser-reaper.service` journal.
+
 ## Router Mode (maxrouter)
 
 maxrouter turns one Claude session into a switchboard for many. You talk to a
