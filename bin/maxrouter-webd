@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+# maxrouter web GUI. Python stdlib only. mxr is the only API to the system;
+# if mxr is missing or broken the dashboard renders an empty state, never 500.
+import hmac
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+TASK_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+LOG_TAIL_BYTES = 262144
+BIND_LABEL = ""
+
+
+def config_root():
+    override = os.environ.get("MAXROUTER_CONFIG_HOME")
+    if override:
+        return override
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(xdg, "maxclaude")
+
+
+def find_mxr():
+    p = shutil.which("mxr")
+    if p:
+        return p
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mxr")
+    if os.access(p, os.X_OK):
+        return p
+    p = os.path.join(os.path.expanduser("~"), ".local", "bin", "mxr")
+    return p if os.access(p, os.X_OK) else None
+
+
+def mxr_run(args, timeout):
+    """Returns (rc, stdout, stderr); rc<0 means mxr missing/timed out."""
+    mxr = find_mxr()
+    if not mxr:
+        return (-1, "", "mxr not found")
+    try:
+        p = subprocess.run([mxr] + args, capture_output=True, text=True, timeout=timeout)
+        return (p.returncode, p.stdout, p.stderr)
+    except subprocess.TimeoutExpired:
+        return (-2, "", "mxr timed out after %ss" % timeout)
+    except OSError as e:
+        return (-1, "", str(e))
+
+
+def mxr_json(args, timeout=20):
+    rc, out, _err = mxr_run(args, timeout)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def log_tail(n=30):
+    path = os.path.join(config_root(), "master-log.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-n:]:
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    out.reverse()
+    return out
+
+
+def get_state():
+    st = {
+        "bind": BIND_LABEL,
+        "config_root": config_root(),
+        "mxr": "unavailable",
+        "orgs": [],
+        "tasks": [],
+        "status": None,
+        "log": log_tail(30),
+    }
+    ok = False
+    orgs = mxr_json(["orgs", "--json"])
+    if orgs is not None:
+        ok = True
+        if isinstance(orgs, dict):
+            orgs = orgs.get("orgs", [])
+        if isinstance(orgs, list):
+            st["orgs"] = [o for o in orgs if isinstance(o, dict)]
+    tasks = mxr_json(["tasks", "--json"])
+    if tasks is not None:
+        ok = True
+        if isinstance(tasks, dict):
+            tasks = tasks.get("tasks", tasks)
+        if isinstance(tasks, dict):
+            tasks = [dict(v, name=k) for k, v in tasks.items() if isinstance(v, dict)]
+        if isinstance(tasks, list):
+            st["tasks"] = [t for t in tasks if isinstance(t, dict) and t.get("name")]
+    status = mxr_json(["status", "--json"])
+    if status is not None:
+        ok = True
+        st["status"] = status
+    if ok:
+        st["mxr"] = "ok"
+    return st
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MAXROUTER</title>
+<style>
+:root{--bg:#0b0e14;--panel:#10141d;--line:#1c2230;--fg:#c9d1e0;--dim:#6b7385;
+--green:#3ddc84;--red:#ff6b6b;--amber:#fdcb6e;--gray:#8b93a7;--ghost:#4a5060}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:baseline;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)}
+header .brand{font-weight:700;letter-spacing:.18em;font-size:15px}
+header .host{color:var(--dim)}
+header .mxr{margin-left:auto;color:var(--red);text-align:right}
+main{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;padding:14px;max-width:1400px;margin:0 auto}
+main>*{min-width:0}
+@media(min-width:768px){main{grid-template-columns:minmax(0,3fr) minmax(0,2fr);align-items:start}}
+.paneltitle{color:var(--dim);text-transform:uppercase;letter-spacing:.12em;font-size:11px;margin:0 0 8px}
+#newform{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+#newform input,#newform select{background:var(--panel);border:1px solid var(--line);color:var(--fg);font:inherit;padding:5px 8px;min-width:0}
+#newform input[name=name]{flex:1 1 110px}
+#newform input[name=desc]{flex:2 1 160px}
+#newerr{color:var(--red);margin:-8px 0 8px;white-space:pre-wrap}
+button{background:var(--panel);border:1px solid var(--line);color:var(--fg);font:inherit;padding:5px 10px;cursor:pointer}
+button:hover{border-color:var(--dim)}
+button:disabled{opacity:.5;cursor:default}
+.org{border-left:3px solid var(--line);background:var(--panel);margin-bottom:14px;padding:10px 12px}
+.orghead{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}
+.orgname{font-weight:700}
+.dim{color:var(--dim)}
+.task{border-top:1px solid var(--line);padding:8px 0}
+.trow{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}
+.tname{font-weight:700}
+.badge{font-size:10px;letter-spacing:.08em;padding:1px 6px;border:1px solid}
+.badge.paned{color:var(--green);border-color:var(--green)}
+.badge.headless{color:var(--gray);border-color:var(--gray)}
+.badge.archived{color:var(--ghost);border-color:var(--ghost)}
+.tlast{color:var(--dim);margin-left:auto}
+.tbtns{display:flex;gap:6px}
+.tbtns button{padding:2px 8px;font-size:11px}
+.tdesc{color:var(--dim);margin:2px 0 6px}
+.archived-task .tname,.archived-task .tdesc{color:var(--ghost)}
+.sendrow{display:flex;gap:6px}
+.sendrow input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);font:inherit;padding:5px 8px;min-width:0}
+.drawer{margin-top:6px;padding:8px;background:var(--bg);border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}
+.drawer.err{border-color:var(--red);color:var(--red)}
+.drawer.pending{color:var(--dim)}
+.drawerx{float:right;padding:0 6px;font-size:11px;margin-left:8px}
+#log{background:var(--panel);border:1px solid var(--line);padding:8px 10px;max-height:70vh;overflow:auto}
+.logline{display:flex;gap:8px;white-space:nowrap;overflow:hidden;padding:1px 0}
+.logline .lts{color:var(--dim);flex:none}
+.logline .ltask{color:var(--amber);flex:none}
+.logline .ldir{color:var(--dim);flex:none}
+.logline .ltext{overflow:hidden;text-overflow:ellipsis}
+.empty{color:var(--dim);padding:8px 0}
+footer{display:flex;flex-wrap:wrap;gap:14px;padding:10px 14px;border-top:1px solid var(--line);color:var(--dim)}
+</style>
+</head>
+<body>
+<header><span class="brand">MAXROUTER</span><span class="host">__BIND__</span><span class="mxr" id="mxrstate"></span></header>
+<main>
+<section>
+<div class="paneltitle">tasks</div>
+<form id="newform">
+<input name="name" placeholder="name" autocomplete="off">
+<select name="org"></select>
+<input name="desc" placeholder="desc" autocomplete="off">
+<button type="submit">new</button>
+</form>
+<div id="newerr"></div>
+<div id="orgs"><div class="empty">loading</div></div>
+</section>
+<aside>
+<div class="paneltitle">master-log</div>
+<div id="log"></div>
+</aside>
+</main>
+<footer><span>config: __CONFIG_ROOT__</span><span id="attach"></span></footer>
+<script>
+'use strict';
+var token=new URLSearchParams(location.search).get('token')||'';
+var drawers={};
+var pending={};
+var state=null;
+
+function hdrs(js){var h={};if(token)h['X-Maxrouter-Token']=token;if(js)h['Content-Type']='application/json';return h;}
+function api(path,body){
+  var o=body?{method:'POST',headers:hdrs(true),body:JSON.stringify(body)}:{headers:hdrs(false)};
+  return fetch(path,o).then(function(r){
+    if(!r.ok)return r.text().then(function(t){throw new Error(r.status+' '+t.slice(0,300));});
+    return r.json();
+  });
+}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
+function rel(iso){
+  if(!iso)return '';
+  var t=Date.parse(iso);
+  if(isNaN(t))return '';
+  var s=Math.max(0,(Date.now()-t)/1000);
+  if(s<60)return Math.floor(s)+'s';
+  if(s<3600)return Math.floor(s/60)+'m';
+  if(s<86400)return Math.floor(s/3600)+'h';
+  return Math.floor(s/86400)+'d';
+}
+function okColor(c){return /^#[0-9a-fA-F]{3,8}$/.test(c||'')?c:'#3a4152';}
+function badgeOf(t){
+  if((t.status||'')==='archived')return['archived','ARCHIVED'];
+  if((t.mode||'')==='paned')return['paned','PANED'];
+  return['headless','HEADLESS'];
+}
+function taskSort(a,b){
+  var aa=a.status==='archived'?1:0,bb=b.status==='archived'?1:0;
+  if(aa!==bb)return aa-bb;
+  return String(b.last||'').localeCompare(String(a.last||''));
+}
+
+function taskCard(t,vals){
+  var name=t.name;
+  var card=el('div','task'+(t.status==='archived'?' archived-task':''));
+  var row=el('div','trow');
+  row.appendChild(el('span','tname',name));
+  var b=badgeOf(t);
+  row.appendChild(el('span','badge '+b[0],b[1]));
+  row.appendChild(el('span','tlast',rel(t.last)));
+  var btns=el('span','tbtns');
+  ['open','close','archive'].forEach(function(a){
+    var bt=el('button',null,a);
+    bt.type='button';
+    bt.onclick=function(){act(name,a);};
+    btns.appendChild(bt);
+  });
+  row.appendChild(btns);
+  card.appendChild(row);
+  if(t.desc)card.appendChild(el('div','tdesc',t.desc));
+  var sr=el('div','sendrow');
+  var inp=el('input');
+  inp.dataset.task=name;
+  inp.placeholder='message';
+  inp.autocomplete='off';
+  if(vals[name]!==undefined)inp.value=vals[name];
+  inp.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendMsg(name);}};
+  var sb=el('button',null,'send');
+  sb.type='button';
+  sb.disabled=!!pending[name];
+  sb.onclick=function(){sendMsg(name);};
+  sr.appendChild(inp);sr.appendChild(sb);
+  card.appendChild(sr);
+  var d=drawers[name];
+  if(d&&d.open){
+    var dr=el('div','drawer'+(d.cls?' '+d.cls:''));
+    var x=el('button','drawerx','x');
+    x.type='button';
+    x.onclick=function(){drawers[name].open=false;render();};
+    dr.appendChild(x);
+    dr.appendChild(document.createTextNode(d.text));
+    card.appendChild(dr);
+  }
+  return card;
+}
+
+function render(){
+  if(!state)return;
+  document.getElementById('mxrstate').textContent=state.mxr==='ok'?'':'mxr unavailable';
+
+  var vals={},focTask=null,focPos=0;
+  document.querySelectorAll('input[data-task]').forEach(function(i){
+    vals[i.dataset.task]=i.value;
+    if(i===document.activeElement){focTask=i.dataset.task;focPos=i.selectionStart;}
+  });
+
+  var orgsDiv=document.getElementById('orgs');
+  orgsDiv.textContent='';
+  var orgs=(state.orgs||[]).slice(),tasks=state.tasks||[];
+  var byOrg={};
+  tasks.forEach(function(t){var o=t.org||'?';(byOrg[o]=byOrg[o]||[]).push(t);});
+  var names=orgs.map(function(o){return o.name;});
+  Object.keys(byOrg).forEach(function(n){if(names.indexOf(n)<0){orgs.push({name:n});names.push(n);}});
+  if(!orgs.length){
+    orgsDiv.appendChild(el('div','empty',state.mxr==='ok'?'no orgs':'no data (mxr unavailable)'));
+  }
+  orgs.forEach(function(o){
+    var sec=el('div','org');
+    sec.style.borderLeftColor=okColor(o.color);
+    var head=el('div','orghead');
+    head.appendChild(el('span','orgname',o.name||'?'));
+    if(o.workdir)head.appendChild(el('span','dim',o.workdir));
+    sec.appendChild(head);
+    var list=(byOrg[o.name]||[]).slice().sort(taskSort);
+    if(!list.length)sec.appendChild(el('div','empty','no tasks'));
+    list.forEach(function(t){sec.appendChild(taskCard(t,vals));});
+    orgsDiv.appendChild(sec);
+  });
+
+  renderLog();
+  renderFooter(tasks);
+  updateOrgSelect();
+
+  if(focTask!==null){
+    var i=document.querySelector('input[data-task="'+focTask+'"]');
+    if(i){i.focus();try{i.setSelectionRange(focPos,focPos);}catch(e){}}
+  }
+}
+
+function renderLog(){
+  var log=document.getElementById('log');
+  log.textContent='';
+  var entries=state.log||[];
+  if(!entries.length){log.appendChild(el('div','empty','empty'));return;}
+  entries.forEach(function(e){
+    var line=el('div','logline');
+    var ts=String(e.ts||'');
+    var m=ts.match(/T(\\d\\d:\\d\\d:\\d\\d)/);
+    line.appendChild(el('span','lts',m?m[1]:ts));
+    line.appendChild(el('span','ltask',e.task||''));
+    line.appendChild(el('span','ldir',e.dir||''));
+    var tx=el('span','ltext',e.text||'');
+    tx.title=e.text||'';
+    line.appendChild(tx);
+    log.appendChild(line);
+  });
+}
+
+function renderFooter(tasks){
+  var hints=tasks.filter(function(t){return t.mode==='paned'&&t.status!=='archived';})
+    .map(function(t){return 'maxclaude attach task-'+t.name;});
+  document.getElementById('attach').textContent=hints.join('  ');
+}
+
+function updateOrgSelect(){
+  var sel=document.querySelector('#newform select');
+  var orgs=(state&&state.orgs)||[];
+  var want=orgs.map(function(o){return o.name;}).join('|');
+  if(sel.dataset.opts===want)return;
+  var cur=sel.value;
+  sel.textContent='';
+  orgs.forEach(function(o){var op=el('option',null,o.name);op.value=o.name;sel.appendChild(op);});
+  sel.dataset.opts=want;
+  if(cur)sel.value=cur;
+}
+
+function act(task,action){
+  drawers[task]={open:true,text:action+' ...',cls:'pending'};
+  render();
+  api('/api/'+action,{task:task}).then(function(r){
+    drawers[task]={open:true,
+      text:r.ok?(r.output||action+' ok'):(r.error||r.output||action+' failed'),
+      cls:r.ok?'':'err'};
+    return refresh();
+  }).catch(function(e){
+    drawers[task]={open:true,text:String(e.message||e),cls:'err'};
+    render();
+  });
+}
+
+function sendMsg(task){
+  if(pending[task])return;
+  var inp=document.querySelector('input[data-task="'+task+'"]');
+  if(!inp)return;
+  var msg=inp.value.trim();
+  if(!msg)return;
+  inp.value='';
+  pending[task]=true;
+  drawers[task]={open:true,text:'> '+msg+'\\nwaiting for reply ...',cls:'pending'};
+  render();
+  api('/api/send',{task:task,message:msg}).then(function(r){
+    pending[task]=false;
+    drawers[task]={open:true,text:r.ok?(r.reply||''):(r.error||'send failed'),cls:r.ok?'':'err'};
+    render();
+  }).catch(function(e){
+    pending[task]=false;
+    drawers[task]={open:true,text:String(e.message||e),cls:'err'};
+    render();
+  });
+}
+
+document.getElementById('newform').onsubmit=function(e){
+  e.preventDefault();
+  var f=e.target;
+  var name=f.elements.namedItem('name').value.trim();
+  var org=f.elements.namedItem('org').value;
+  var desc=f.elements.namedItem('desc').value.trim();
+  var errbox=document.getElementById('newerr');
+  if(!name||!org)return;
+  api('/api/new',{name:name,org:org,desc:desc}).then(function(r){
+    if(r.ok){
+      f.elements.namedItem('name').value='';
+      f.elements.namedItem('desc').value='';
+      errbox.textContent='';
+    }else{
+      errbox.textContent=r.error||r.output||'new failed';
+    }
+    refresh();
+  }).catch(function(err){
+    errbox.textContent=String(err.message||err);
+  });
+};
+
+function refresh(){
+  return api('/api/state').then(function(s){state=s;render();})
+    .catch(function(e){
+      document.getElementById('mxrstate').textContent='state fetch failed: '+String(e.message||e).slice(0,120);
+    });
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "maxrouter-webd"
+    ACTIONS = {"/api/open": "open", "/api/close": "close", "/api/archive": "archive"}
+
+    # keep tokens (?token=) out of logs
+    def log_request(self, code="-", size="-"):
+        sys.stderr.write("%s %s %s\n" % (self.command, self.path.split("?", 1)[0], code))
+
+    def _authorized(self, allow_query=False):
+        tok = os.environ.get("MAXROUTER_TOKEN", "")
+        if not tok:
+            return True
+        got = self.headers.get("X-Maxrouter-Token", "")
+        if got and hmac.compare_digest(got, tok):
+            return True
+        if allow_query:
+            q = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+            if q and hmac.compare_digest(q, tok):
+                return True
+        return False
+
+    def _reply(self, code, ctype, body):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._reply(code, "application/json", json.dumps(obj))
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/":
+            if not self._authorized(allow_query=True):
+                return self._json({"error": "unauthorized"}, 401)
+            page = PAGE.replace("__BIND__", html.escape(BIND_LABEL)).replace(
+                "__CONFIG_ROOT__", html.escape(config_root()))
+            return self._reply(200, "text/html; charset=utf-8", page)
+        if path == "/api/state":
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
+            try:
+                return self._json(get_state())
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if not self._authorized():
+            return self._json({"error": "unauthorized"}, 401)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n > 1048576:
+            return self._json({"error": "body too large"}, 413)
+        try:
+            body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._json({"error": "invalid json"}, 400)
+        if not isinstance(body, dict):
+            return self._json({"error": "invalid json"}, 400)
+
+        if path in self.ACTIONS:
+            task = body.get("task", "")
+            if not isinstance(task, str) or not TASK_RE.match(task):
+                return self._json({"error": "invalid task name"}, 400)
+            rc, out, err = mxr_run([self.ACTIONS[path], task], timeout=60)
+            code = 404 if rc != 0 and "no such task" in (err + out) else 200
+            return self._json({"ok": rc == 0, "output": out.strip(), "error": err.strip() or None}, code)
+
+        if path == "/api/new":
+            name = body.get("name", "")
+            org = body.get("org", "")
+            desc = body.get("desc", "")
+            if not isinstance(name, str) or not TASK_RE.match(name):
+                return self._json({"error": "invalid task name"}, 400)
+            if not isinstance(org, str) or not org or org.startswith("-"):
+                return self._json({"error": "invalid org"}, 400)
+            if not isinstance(desc, str):
+                return self._json({"error": "invalid desc"}, 400)
+            rc, out, err = mxr_run(["new", name, "--org", org, "--desc", desc], timeout=60)
+            return self._json({"ok": rc == 0, "output": out.strip(), "error": err.strip() or None})
+
+        if path == "/api/send":
+            task = body.get("task", "")
+            msg = body.get("message", "")
+            if not isinstance(task, str) or not TASK_RE.match(task):
+                return self._json({"error": "invalid task name"}, 400)
+            if not isinstance(msg, str) or not msg.strip():
+                return self._json({"error": "empty message"}, 400)
+            rc, out, err = mxr_run(["send", task, msg, "--timeout", "120"], timeout=150)
+            if rc == 0:
+                return self._json({"ok": True, "reply": out.strip()})
+            code = 404 if "no such task" in (err + out) else 200
+            return self._json({"ok": False, "error": err.strip() or out.strip() or "mxr send failed"}, code)
+
+        return self._json({"error": "not found"}, 404)
+
+
+def resolve_bind():
+    """Returns (host, auto) where auto means the host was self-detected."""
+    env = os.environ.get("MAXROUTER_BIND")
+    if env:
+        return env, False
+    try:
+        p = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5)
+        if p.returncode == 0:
+            lines = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+            if lines:
+                return lines[0], True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "127.0.0.1", False
+
+
+def main():
+    global BIND_LABEL
+    host, auto = resolve_bind()
+    port = int(os.environ.get("MAXROUTER_PORT", "8787"))
+    try:
+        srv = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        if not auto:
+            raise
+        sys.stderr.write("bind %s:%s failed (%s); falling back to 127.0.0.1\n" % (host, port, e))
+        host = "127.0.0.1"
+        srv = ThreadingHTTPServer((host, port), Handler)
+    BIND_LABEL = "%s:%s" % (host, port)
+    sys.stderr.write("maxrouter-webd listening on %s\n" % BIND_LABEL)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

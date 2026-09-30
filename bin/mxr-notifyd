@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# mxr-notifyd: the event-driven bridge that replaces the router's timer polling.
+#
+# Watches the outbox dir with inotify. When an ASYNC worker reply lands there -
+# a paned worker's Stop hook (mxr-outbox) atomically mv's <sid>.json in, or a
+# headless async send writes it directly: it pokes the router pane (via
+# mxr-notify) so the router relays right away. Nothing here is on a timer; it
+# blocks in the kernel until a file event arrives.
+#
+# It fires ONLY when mxr left a .notify/<sid> marker for that send. Synchronous
+# sends (where the router is blocked in `mxr send` and already gets the reply
+# inline) write no marker and are ignored: so the router is never poked twice.
+set -uo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+OUTBOX="$MXR_HOME/router/outbox"
+MARKERS="$OUTBOX/.notify"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+NOTIFY="$BIN_DIR/mxr-notify"
+
+mkdir -p "$OUTBOX" "$MARKERS"
+command -v inotifywait >/dev/null 2>&1 || {
+  echo "mxr-notifyd: inotifywait not found (apt install inotify-tools)" >&2; exit 127; }
+[ -x "$NOTIFY" ] || { echo "mxr-notifyd: $NOTIFY not executable" >&2; exit 127; }
+
+# Singleton guard: two watchers on one outbox would race to consume the same
+# .notify marker, so only one gets to poke: the other silently drops replies.
+# flock makes a second instance exit instead of double-watching.
+LOCK="$MXR_HOME/router/.notifyd.lock"
+exec 9>"$LOCK" || { echo "mxr-notifyd: cannot open lock $LOCK" >&2; exit 1; }
+if ! flock -n 9; then
+  echo "mxr-notifyd: another instance already holds $LOCK; exiting" >&2; exit 0
+fi
+
+echo "mxr-notifyd: watching $OUTBOX (router push, no polling)" >&2
+
+# -m keep monitoring, -q quiet. close_write catches direct writes (headless
+# async), moved_to catches the atomic rename the Stop hook does. The markers
+# subdir is not a direct child event source, so it never self-triggers.
+inotifywait -m -q -e close_write -e moved_to --format '%f' "$OUTBOX" 2>/dev/null | \
+while IFS= read -r f; do
+  case "$f" in
+    .*|*.tmp|"") continue ;;   # hidden temp files (.SID.XXXX), stray tmp, empty
+    *.json) ;;                 # only reply files
+    *) continue ;;
+  esac
+  sid="${f%.json}"
+  marker="$MARKERS/$sid"
+  # Only async dispatches leave a marker; consume it so we poke exactly once.
+  if [ -e "$marker" ]; then
+    rm -f "$marker"
+    preview="$(jq -r '.text // ""' "$OUTBOX/$f" 2>/dev/null | head -c 160 || true)"
+    "$NOTIFY" "$sid" "$preview" || true
+  fi
+done

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# mxr-notify: push an event line into the router's zellij pane so the router
+# reacts immediately: this is what lets the router stop polling on a timer.
+# Reuses the same bracketed-paste write-chars path mxr uses to drive worker
+# panes. ALWAYS exits 0: it must never wedge a worker or a watcher.
+#
+# Forms:
+#   mxr-notify <sid|task> [preview]              -> [worker-reply]  (back-compat)
+#   mxr-notify reply   <sid|task> [preview]      -> [worker-reply]
+#   mxr-notify blocked <sid|task> <prompt-text>  -> [worker-blocked]
+#   mxr-notify raw     <task>     <full-text>    -> verbatim (heartbeats/alerts)
+#
+# Target session is `router`, overridable with MAXROUTER_NOTIFY_SESSION (used by
+# the test harness to poke a throwaway session instead of the live router).
+set -uo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+REG="$MXR_HOME/registry.json"
+OUTBOX="$MXR_HOME/router/outbox"
+DEFAULT_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
+# TARGET SCOPING (INCIDENT 2026-08-02, addendum #3): a push must be scoped to
+# its config home. Only the PRODUCTION instance (default config home) may target
+# the real `router` pane. A sandbox/test instance (non-default config home) must
+# name its own target explicitly or the push is SUPPRESSED: it can never type
+# into the production router.
+if [ -n "${MAXROUTER_NOTIFY_SESSION:-}" ]; then
+  ROUTER_SESSION="$MAXROUTER_NOTIFY_SESSION"
+elif [ "$MXR_HOME" = "$DEFAULT_CFG" ]; then
+  ROUTER_SESSION="router"
+else
+  echo "mxr-notify: config home '$MXR_HOME' is non-default and MAXROUTER_NOTIFY_SESSION is unset: SUPPRESSING push so a sandbox never types into the production router." >&2
+  exit 0
+fi
+ZJ="$HOME/.local/bin/zellij"; [ -x "$ZJ" ] || ZJ="$(command -v zellij || echo zellij)"
+
+# zellij must never see the caller's ZELLIJ_* env or it grafts onto that session
+zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
+
+kind=reply
+case "${1:-}" in
+  reply)   kind=reply;   shift ;;
+  blocked) kind=blocked; shift ;;
+  raw)     kind=raw;     shift ;;
+esac
+
+arg="${1:-}"; [ -n "$arg" ] || { echo "usage: mxr-notify [reply|blocked] <sid|task> [text]" >&2; exit 0; }
+payload="${2:-}"
+
+# resolve task + sid from either a task name or a session id, and VALIDATE the
+# task exists in THIS registry (addendum #3: no phantom pushes at the source).
+task="$arg"; sid=""
+if [ -f "$REG" ]; then
+  task="$(jq -r --arg a "$arg" '.tasks | to_entries[] | select(.key==$a or .value.sid==$a) | .key' "$REG" 2>/dev/null | head -n1)"
+fi
+if [ -z "$task" ]; then
+  echo "mxr-notify: refusing push: '$arg' is not a task in this registry ($REG). No phantom pushes." >&2
+  exit 0
+fi
+sid="$(jq -r --arg t "$task" '.tasks[$t].sid // ""' "$REG" 2>/dev/null)"
+outfile="$OUTBOX/$sid.json"
+# provenance so the router can verify a push before acting (the pane accepts
+# typed input, so a push is an injection vector).
+prov="[provenance sid=$sid outbox=$outfile cfg=$MXR_HOME]"
+
+# no-op unless the target router session is actually live
+live="$(zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -vi EXITED | awk 'NF{print $1}')"
+grep -qxF "$ROUTER_SESSION" <<<"$live" || exit 0
+
+if [ "$kind" = raw ]; then
+  msg="$payload  $prov"
+elif [ "$kind" = blocked ]; then
+  msg="[worker-blocked] worker '$task' is BLOCKED awaiting input in its pane (an interactive menu / permission / trust prompt is frozen there). Relay this decision to the operator NOW and send their answer back with: mxr send $task \"<answer>\"  (or to pick a numbered option: mxr send $task \"1\"). This is a push: do not wait or poll.  $prov
+--- prompt on the worker's screen ---
+$payload"
+else
+  # reply: REFUSE to push a reply that does not exist (INCIDENT 2026-08-02: a
+  # false [worker-reply] fired for a reply never written).
+  if [ -z "$sid" ] || [ ! -f "$outfile" ]; then
+    echo "mxr-notify: refusing [worker-reply] push for '$task': no outbox reply (sid=${sid:-?}). Worker is mid-turn." >&2
+    exit 0
+  fi
+  msg="[worker-reply] worker '$task' finished: its reply is waiting in the outbox. Relay it to the user now: verify $outfile exists under YOUR config home, then run 'mxr log -n 5', take the newest task->user line for '$task', relay it verbatim-trimmed prefixed with [org/task]. This is a push, not a poll: do not set any timer or wakeup.  $prov"
+  [ -n "$payload" ] && msg="$msg  (preview: ${payload:0:160})"
+fi
+
+# bracketed paste keeps newlines/quotes from mis-firing; then Enter (13) submits
+zj --session "$ROUTER_SESSION" action write-chars -p terminal_0 \
+   $'\e[200~'"$msg"$'\e[201~' 2>/dev/null || exit 0
+zj --session "$ROUTER_SESSION" action write -p terminal_0 13 2>/dev/null || exit 0
+exit 0

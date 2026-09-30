@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Close abandoned temporary headless agent-browser instances.
+set -euo pipefail
+
+browser_limit_seconds() {
+  local value="$1"
+  if ! [[ "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+    echo "maxclaude-browser-reaper: MAXCLAUDE_BROWSER_MAX_HOURS must be a non-negative number" >&2
+    return 2
+  fi
+  awk -v hours="$value" 'BEGIN { printf "%.0f", hours * 3600 }'
+}
+
+profile_for_command() {
+  local command="$1"
+  if [[ "$command" =~ (^|[[:space:]])--user-data-dir=([^[:space:]]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  elif [[ "$command" =~ (^|[[:space:]])--user-data-dir[[:space:]]+([^[:space:]]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+}
+
+is_temporary_profile() {
+  local profile="$1" canonical
+  canonical="$(readlink -f -- "$profile" 2>/dev/null)" || return 1
+  [ "$canonical" = /tmp ] || [[ "$canonical" == /tmp/* ]]
+}
+
+is_chrome_executable() {
+  case "$(basename "$1")" in
+    chrome|chromium|chromium-browser|google-chrome|google-chrome-stable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_agent_browser_executable() {
+  case "$(basename "$1")" in
+    agent-browser|agent-browser-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_temporary_headless() {
+  local command=" $1 " profile
+  [[ "$command" =~ (^|[[:space:]])--headless(=|[[:space:]]|$) ]] || return 1
+  profile="$(profile_for_command "$command")" || return 1
+  is_temporary_profile "$profile"
+}
+
+is_expired() {
+  local elapsed="$1" limit_seconds="$2"
+  [[ "$elapsed" =~ ^[0-9]+$ ]] && [ "$elapsed" -ge "$limit_seconds" ]
+}
+
+log() {
+  printf 'maxclaude-browser-reaper: %s\n' "$*"
+}
+
+cmdline() {
+  tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true
+}
+
+session_from_agent_browser_command() {
+  local command="$1" value=""
+  if [[ "$command" =~ (^|[[:space:]])--session[[:space:]]+([^[:space:]]+) ]]; then
+    value="${BASH_REMATCH[2]}"
+  elif [[ "$command" =~ (^|[[:space:]])--session=([^[:space:]]+) ]]; then
+    value="${BASH_REMATCH[2]}"
+  fi
+  [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+agent_browser_session_for_pid() {
+  local pid="$1" parent command executable value
+  while [ "$pid" -gt 1 ] 2>/dev/null && [ -r "/proc/$pid/cmdline" ]; do
+    command="$(cmdline "$pid")"
+    executable="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+    if is_agent_browser_executable "$executable"; then
+      if value="$(session_from_agent_browser_command "$command")"; then
+        printf '%s\n' "$value"
+        return 0
+      fi
+      value="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^AGENT_BROWSER_SESSION=//p' | head -n 1)"
+      if [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        printf '%s\n' "$value"
+        return 0
+      fi
+    fi
+    parent="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+    [ -n "$parent" ] && [ "$parent" != "$pid" ] || break
+    pid="$parent"
+  done
+  return 1
+}
+
+process_stamp() {
+  awk '{print $22}' "/proc/$1/stat" 2>/dev/null || true
+}
+
+collect_tree() {
+  local pid="$1" child stamp
+  stamp="$(process_stamp "$pid")"
+  [ -n "$stamp" ] || return 0
+  REAPER_TREE+=("$pid:$stamp")
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    collect_tree "$child"
+  done
+}
+
+same_process() {
+  local member="$1" pid stamp
+  pid="${member%%:*}"
+  stamp="${member#*:}"
+  [ "$(process_stamp "$pid")" = "$stamp" ]
+}
+
+terminate_tree() {
+  local root_member="$1" pid member
+  pid="${root_member%%:*}"
+  same_process "$root_member" || return 1
+  REAPER_TREE=()
+  collect_tree "$pid"
+  for member in "${REAPER_TREE[@]}"; do
+    if same_process "$member"; then
+      kill -TERM "${member%%:*}" 2>/dev/null || true
+    fi
+  done
+  sleep 2
+  for member in "${REAPER_TREE[@]}"; do
+    if same_process "$member"; then
+      kill -KILL "${member%%:*}" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for member in "${REAPER_TREE[@]}"; do
+    same_process "$member" && return 1
+  done
+  return 0
+}
+
+main() {
+  local limit_seconds proc pid command executable elapsed stamp root_member session
+  limit_seconds="$(browser_limit_seconds "${MAXCLAUDE_BROWSER_MAX_HOURS:-0}")" || return $?
+  if [ "$limit_seconds" -le 0 ]; then
+    return 0
+  fi
+  for proc in /proc/[0-9]*; do
+  pid="${proc#/proc/}"
+  [ -r "$proc/cmdline" ] || continue
+  stamp="$(process_stamp "$pid")"
+  [ -n "$stamp" ] || continue
+  root_member="$pid:$stamp"
+  command="$(cmdline "$pid")"
+  executable="$(readlink -f -- "$proc/exe" 2>/dev/null || true)"
+  is_chrome_executable "$executable" || continue
+  is_temporary_headless "$command" || continue
+  elapsed="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  is_expired "$elapsed" "$limit_seconds" || continue
+  same_process "$root_member" || continue
+
+  session="$(agent_browser_session_for_pid "$pid" || true)"
+  if same_process "$root_member" && [ -n "$session" ] && command -v agent-browser >/dev/null 2>&1; then
+    if agent-browser --session "$session" close >/dev/null 2>&1; then
+      log "closed agent-browser session=$session pid=$pid age_seconds=$elapsed"
+    else
+      log "agent-browser close failed session=$session pid=$pid age_seconds=$elapsed"
+    fi
+  fi
+  if same_process "$root_member"; then
+    if terminate_tree "$root_member"; then
+      log "terminated temporary headless browser pid=$pid age_seconds=$elapsed"
+    else
+      log "temporary headless browser still present pid=$pid age_seconds=$elapsed"
+    fi
+  fi
+done
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

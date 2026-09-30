@@ -1,0 +1,18 @@
+[Unit]
+Description=maxclaude web agent
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_ROOT@
+ExecStart=/usr/bin/env node @INSTALL_ROOT@/src/index.js
+Restart=always
+RestartSec=5
+KillMode=control-group
+EnvironmentFile=-@ENV_FILE@
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

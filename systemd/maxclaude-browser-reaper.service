@@ -1,0 +1,7 @@
+[Unit]
+Description=Close expired temporary headless browsers
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/maxagent/browser-reaper.env
+ExecStart=%h/.local/bin/maxclaude-browser-reaper

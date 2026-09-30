@@ -1,0 +1,25 @@
+services:
+  hub:
+    build:
+      context: ../hub
+    image: maxclaude-web-hub:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAXCLAUDE_WEB_PORT:-8080}:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATA_DIR: /data
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:?set OPERATOR_PASSWORD outside this file}
+      AGENT_SECRET: ${AGENT_SECRET:?set AGENT_SECRET outside this file}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-30}
+      LOGIN_WINDOW_S: ${LOGIN_WINDOW_S:-900}
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-8}
+      LOCKOUT_BASE_S: ${LOCKOUT_BASE_S:-900}
+      LOCKOUT_MAX_S: ${LOCKOUT_MAX_S:-21600}
+    volumes:
+      - maxclaude-web-data:/data
+
+volumes:
+  maxclaude-web-data:

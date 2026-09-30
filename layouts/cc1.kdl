@@ -1,0 +1,45 @@
+// maxclaude 1 - single persistent Claude pane.
+layout {
+    default_tab_template {
+        children
+        pane size=1 borderless=true {
+            plugin location="file:~/.config/zellij/plugins/zjstatus.wasm" {
+                format_left  "{mode}#[fg=blue,bold] {session} {tabs}"
+                format_right "{command_usage}"
+                format_space ""
+
+                border_enabled "false"
+
+                mode_normal       "#[bg=green,fg=black,bold] NORMAL "
+                mode_locked       "#[bg=red,fg=black,bold] LOCKED "
+                mode_pane         "#[bg=blue,fg=black,bold] PANE "
+                mode_tab          "#[bg=blue,fg=black,bold] TAB "
+                mode_resize       "#[bg=yellow,fg=black,bold] RESIZE "
+                mode_move         "#[bg=yellow,fg=black,bold] MOVE "
+                mode_scroll       "#[bg=magenta,fg=black,bold] SCROLL "
+                mode_enter_search "#[bg=magenta,fg=black,bold] SEARCH "
+                mode_search       "#[bg=magenta,fg=black,bold] SEARCH "
+                mode_rename_tab   "#[bg=cyan,fg=black,bold] RENAME "
+                mode_rename_pane  "#[bg=cyan,fg=black,bold] RENAME "
+                mode_session      "#[bg=cyan,fg=black,bold] SESSION "
+                mode_prompt       "#[bg=cyan,fg=black,bold] PROMPT "
+                mode_tmux         "#[bg=red,fg=black,bold] TMUX "
+
+                tab_normal "#[fg=white] {name} "
+                tab_active "#[bg=white,fg=black,bold] {name} "
+
+                command_usage_command    "bash -lc '$HOME/.local/bin/maxagent-usage'"
+                command_usage_format     "#[fg=white] {stdout} "
+                command_usage_interval   "300"
+                command_usage_rendermode "static"
+            }
+        }
+    }
+    pane_template name="cc" {
+        command "bash"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+    }
+    tab name="claude" focus=true {
+        cc
+    }
+}

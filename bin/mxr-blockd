@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# mxr-blockd: surfaces a SILENTLY BLOCKED worker within seconds.
+#
+# A paned worker's claude can drop into a modal TUI that waits for a keypress -
+# an AskUserQuestion menu, a permission prompt, or the folder-trust dialog: and
+# nothing writes to the outbox, so the reply-bridge (mxr-notifyd) never fires and
+# the worker hangs invisibly. There is no filesystem event for "a menu rendered",
+# so this watcher SAMPLES each paned worker's screen on a short interval and, the
+# moment it sees the blocked signature, PUSHES a [worker-blocked] event (with the
+# prompt + options) into the router pane via mxr-notify. The router: not a human
+# and not a timer: then relays the question to the operator.
+#
+# The router itself never polls: this lightweight watcher does the sampling and
+# pushes. Dedup keeps it to one push per distinct block; it clears when unblocked.
+set -uo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+BLOCKED_DIR="$MXR_HOME/router/outbox/.blocked"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+NOTIFY="$BIN_DIR/mxr-notify"
+INTERVAL="${MXR_BLOCK_INTERVAL:-3}"
+ZJ="$HOME/.local/bin/zellij"; [ -x "$ZJ" ] || ZJ="$(command -v zellij || echo zellij)"
+zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
+
+mkdir -p "$BLOCKED_DIR"
+[ -x "$NOTIFY" ] || { echo "mxr-blockd: $NOTIFY not executable" >&2; exit 127; }
+
+# Singleton: two scanners would double-push the same block.
+LOCK="$MXR_HOME/router/.blockd.lock"
+exec 8>"$LOCK" || { echo "mxr-blockd: cannot open lock $LOCK" >&2; exit 1; }
+if ! flock -n 8; then
+  echo "mxr-blockd: another instance already holds $LOCK; exiting" >&2; exit 0
+fi
+
+# BLOCK SIGNATURE: keep textually identical to pane_state() in bin/mxr.
+# A modal awaiting a keypress: numbered selection cursor "❯ 1.", or a
+# menu/permission/trust footer. (grep -E, UTF-8.)
+BLOCK_SIG='❯ [0-9]+\.|Enter to select|to navigate|to cancel|Do you trust the files|Do you want to proceed|Yes, proceed|No, exit|allow all edits|Do you want to make this edit|Press enter to continue'
+# The affordances a live modal REPLACES. If either is on screen, the pane has a
+# normal input box or a running spinner: so any BLOCK_SIG match is just menu
+# text in scrollback, NOT an active modal. Keep identical to bin/mxr.
+LIVE_AFFORDANCE='bypass permissions on|shift\+tab to cycle|esc to interrupt'
+
+live_task_sessions(){
+  zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -vi EXITED | awk 'NF{print $1}' | grep '^task-' || true
+}
+
+# extract the question + options from a screen (chrome/box-draw stripped)
+extract_prompt(){
+  sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -vE '^[[:space:]]*[─╭╮╰╯│┌┐└┘━┃]+[[:space:]]*$' \
+    | grep -vE 'bypass permissions on|shift\+tab to cycle|Opus [0-9]|Sonnet [0-9]|Haiku [0-9]|Fable [0-9]|setup issues|ctx \[|for shortcuts|/doctor|context left' \
+    | awk 'NF' | tail -n 22
+}
+
+echo "mxr-blockd: scanning paned workers every ${INTERVAL}s for blocked prompts (push, no router polling)" >&2
+
+while :; do
+  seen=""
+  while IFS= read -r sess; do
+    [ -n "$sess" ] || continue
+    seen="$seen $sess"
+    scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || continue
+    [ -n "$scr" ] || continue
+    marker="$BLOCKED_DIR/$sess"
+    blocked=0
+    # candidate = signature present AND no live input/spinner affordance...
+    if grep -qE "$BLOCK_SIG" <<<"$scr" && ! grep -qE "$LIVE_AFFORDANCE" <<<"$scr"; then
+      # ...and STATIC (a real modal is frozen; a working pane rendering menu text
+      # in scrollback keeps animating). Confirms with one 0.5s re-dump.
+      sleep 0.5
+      scr2="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || scr2=""
+      [ -n "$scr2" ] && [ "$scr" = "$scr2" ] && blocked=1
+    fi
+    if [ "$blocked" = 1 ]; then
+      prompt="$(extract_prompt <<<"$scr")"
+      hash="$(printf '%s' "$prompt" | cksum | awk '{print $1}')"
+      if [ ! -f "$marker" ] || [ "$(cat "$marker" 2>/dev/null)" != "$hash" ]; then
+        printf '%s' "$hash" > "$marker"
+        task="${sess#task-}"
+        echo "mxr-blockd: BLOCKED $task -> pushing to router" >&2
+        "$NOTIFY" blocked "$task" "$prompt" || true
+      fi
+    else
+      # not blocked (working / idle / unblocked): forget it so a future block re-notifies.
+      [ -f "$marker" ] && rm -f "$marker"
+    fi
+  done < <(live_task_sessions)
+  # prune markers for sessions that no longer exist
+  for m in "$BLOCKED_DIR"/*; do
+    [ -e "$m" ] || continue
+    b="$(basename "$m")"
+    case " $seen " in *" $b "*) ;; *) rm -f "$m" ;; esac
+  done
+  sleep "$INTERVAL"
+done

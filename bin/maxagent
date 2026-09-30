@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# maxagent — persistent coding-agent session(s) in a zellij multiplexer.
+# maxagent: persistent coding-agent session(s) in a zellij multiplexer.
 #
-#   maxagent [codex|claude]          2x2 grid of 4 panes
+#   maxagent [codex|claude]          single pane (same as 1)
 #   maxagent [codex|claude] 1|2|3|4  numbered N-pane session
-#   maxagent [codex|claude] <name>   named workspace, 4 panes
+#   maxagent [codex|claude] <name>   named workspace, 1 pane
 #   maxagent [codex|claude] <name> N named workspace with N panes
 #   maxagent ls                      list live sessions
 #   maxagent attach <number|name>    attach a listed session or named session
 #   maxagent close <number|name|all> close sessions
+#   maxagent hide <number|name>      stop a session but keep it for its next attach
 #
 # Provider shortcuts are installed as maxcodex and maxclaude.
 
@@ -22,7 +23,7 @@ SESSION_PREFIX="${MAXAGENT_SESSION_PREFIX:-}"
 if [ -z "${MAXAGENT_DEFAULT_PROVIDER:-}" ] && [ -r "$CONFIG_ROOT/defaults.env" ]; then
   # Read the configured default in a subshell so the file's other variables
   # don't leak into this process (and from here into every pane).
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   _dp="$(. "$CONFIG_ROOT/defaults.env" 2>/dev/null; printf '%s' "${MAXAGENT_DEFAULT_PROVIDER:-}")"
   case "$_dp" in codex|claude) DEFAULT_PROVIDER="$_dp" ;; esac
 fi
@@ -49,7 +50,7 @@ export COLORTERM="${COLORTERM:-truecolor}"
 
 _usage(){
   cat <<EOF
-$APP — persistent Codex/Claude panes in zellij
+$APP: persistent Codex/Claude panes in zellij
 
 Usage:
   $APP [codex|claude] [1|2|3|4] [--yolo|--safe]
@@ -57,7 +58,10 @@ Usage:
   $APP ls
   $APP attach <number|name>
   $APP close <number|name|all>
+  $APP hide <number|name>
   $APP prune
+
+With no pane count, $APP opens a single pane. Pass 2, 3 or 4 for more.
 
 Note: 'codex' and 'claude' are provider selectors, so they cannot be used as
 workspace names. Pick another name (e.g. '$APP codex work').
@@ -198,7 +202,7 @@ _prune(){
   for meta in "$(_session_meta_dir)"/*.env; do
     [ -e "$meta" ] || continue
     name="$(basename "$meta" .env)"
-    grep -qxF "$name" <<<"$live" || rm -f "$meta"
+    grep -qxF "$name" <<<"$live" || [ "$(_meta_value "$name" MAXAGENT_HIDDEN)" = 1 ] || rm -f "$meta"
   done
   _has_systemd || return 0
   for u in $(systemctl --user list-units 'maxagent-named@*' 'maxclaude@*' 'maxclaude-named@*' --no-legend 2>/dev/null | awk '{print $1}'); do
@@ -267,9 +271,69 @@ _close(){
   echo "Closed session: $sess."
 }
 
+# Session ids of the Claude processes running directly in the session's panes.
+_pane_claude_sids(){
+  local pid ppid
+  for pid in $(pgrep -x claude 2>/dev/null); do
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ "$(ps -o comm= -p "$ppid" 2>/dev/null)" = zellij ] || continue
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qxF "ZELLIJ_SESSION_NAME=$1" || continue
+    sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/${pid}.json" 2>/dev/null || true
+  done | sort -u
+}
+
+_hide(){
+  local sess="$1" meta unit panes sids envf
+  meta="$(_session_meta_dir)/${sess}.env"
+  unit="$(_meta_value "$sess" MAXAGENT_UNIT 2>/dev/null || true)"
+  if _has_systemd && systemctl --user is-active --quiet "$(_legacy_unit_for "$sess")"; then
+    unit="$(_legacy_unit_for "$sess")"
+  fi
+  [ -n "$unit" ] || unit="$(_unit_for "$sess")"
+  if [ ! -r "$meta" ]; then
+    panes="$(head -n 1 "$LEGACY_CONFIG_ROOT/${sess}.panes" 2>/dev/null || true)"
+    case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+    _write_session_meta "$sess" "$DEFAULT_PROVIDER" "$panes"
+  fi
+  # maxclaude-pane resumes MAXCLAUDE_RESUME_SID, so record the pane's live conversation.
+  if [ "$unit" = "$(_legacy_unit_for "$sess")" ]; then
+    sids="$(_pane_claude_sids "$sess" || true)"
+    if [ -n "$sids" ] && [ "$(wc -l <<<"$sids")" -eq 1 ]; then
+      envf="$LEGACY_CONFIG_ROOT/sessions/${sess}.env"
+      mkdir -p "$LEGACY_CONFIG_ROOT/sessions"
+      { grep -v '^MAXCLAUDE_RESUME_SID=' "$envf" 2>/dev/null || true; printf 'MAXCLAUDE_RESUME_SID=%s\n' "$sids"; } > "$envf.tmp"
+      mv "$envf.tmp" "$envf"
+    elif [ -n "$sids" ]; then
+      echo "$APP: $sess has $(wc -l <<<"$sids") Claude conversations; only one can be resumed, keeping the recorded one." >&2
+    fi
+  fi
+  sed -i '/^MAXAGENT_HIDDEN=/d; /^MAXAGENT_UNIT=/d' "$meta"
+  printf 'MAXAGENT_HIDDEN=1\nMAXAGENT_UNIT=%s\n' "$unit" >> "$meta"
+  if _has_systemd; then
+    systemctl --user disable --now "$(_unit_for "$sess")" >/dev/null 2>&1 || true
+    systemctl --user disable --now "$(_legacy_unit_for "$sess")" >/dev/null 2>&1 || true
+  fi
+  "$MAXAGENT_ZELLIJ" kill-session "$sess" >/dev/null 2>&1 || true
+  "$MAXAGENT_ZELLIJ" delete-session -f "$sess" >/dev/null 2>&1 || true
+  echo "Hidden session: $sess. Bring it back with: $APP attach $sess"
+}
+
+_clear_hidden(){
+  sed -i '/^MAXAGENT_HIDDEN=/d' "$(_session_meta_dir)/${1}.env" 2>/dev/null || true
+}
+
+_start_unit(){
+  local unit
+  unit="$(_meta_value "$1" MAXAGENT_UNIT 2>/dev/null || true)"
+  [ -n "$unit" ] || unit="$(_unit_for "$1")"
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  systemctl --user start "$unit" >/dev/null 2>&1 \
+    || { echo "Failed to start $unit:" >&2; systemctl --user status "$unit" --no-pager | head -n 10; return 1; }
+  _clear_hidden "$1"
+}
+
 _open(){
-  local provider="$1" sel="$2" panes="${3:-4}" yolo="${4:-}" session layout
-  case "$panes" in 1|2|3|4) ;; *) panes=4 ;; esac
+  local provider="$1" sel="$2" panes="${3:-}" yolo="${4:-}" session layout
   [ -n "${ZELLIJ:-}" ] && {
     echo "Already inside a zellij session (${ZELLIJ_SESSION_NAME:-?})." >&2
     echo "Detach with Ctrl-o d, then run $APP from a plain shell to (re)attach." >&2
@@ -278,9 +342,15 @@ _open(){
   case "$sel" in max[1-4]) [ "$provider" = "claude" ] && sel="${sel#max}" ;; esac
   session="$(_session_for "$provider" "$sel")" || { echo "invalid session name: $sel" >&2; return 2; }
   case "$sel" in 1|2|3|4) panes="$sel" ;; esac
-  layout="agent${panes}"
   local meta_file prov_arg yolo_arg current_yolo
   meta_file="$(_session_meta_dir)/${session}.env"
+  # No explicit pane count: reuse the recorded count so reopening a session
+  # can't clobber its shape; default to 1 only when there is no metadata.
+  if [ -z "$panes" ] && [ -r "$meta_file" ]; then
+    panes="$(_meta_value "$session" MAXAGENT_PANES 2>/dev/null || echo '')"
+  fi
+  case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+  layout="agent${panes}"
   if _session_exists "$session"; then
     # Re-attach to a live session. Only enforce the yolo check when we have
     # recorded metadata (a pre-upgrade session has none; don't false-alarm).
@@ -298,24 +368,30 @@ _open(){
     else
       _write_session_meta "$session" "$provider" "$panes" "$yolo"
     fi
-  else
+  elif [ "$(_meta_value "$session" MAXAGENT_HIDDEN 2>/dev/null)" != 1 ]; then
     _write_session_meta "$session" "$provider" "$panes" "$yolo"
   fi
   if _has_systemd; then
-    loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-    systemctl --user start "$(_unit_for "$session")" >/dev/null 2>&1 \
-      || { echo "Failed to start $(_unit_for "$session"):" >&2; systemctl --user status "$(_unit_for "$session")" --no-pager | head -n 10; return 1; }
+    _start_unit "$session" || return 1
     "$MAXAGENT_ZELLIJ" attach "$session"
   else
+    _clear_hidden "$session"
     exec "$MAXAGENT_ZELLIJ" --layout "$layout" attach -c "$session"
   fi
 }
 
 _list(){
-  local names i=0 nm provider panes yolo tags label
+  local names i=0 nm provider panes yolo tags label meta hidden=""
   _prune
   names="$(_sessions)"
-  if [ -z "$names" ]; then echo "No ${APP} sessions."; return; fi
+  for meta in "$(_session_meta_dir)"/*.env; do
+    [ -e "$meta" ] || continue
+    nm="$(basename "$meta" .env)"
+    if [ "$(_meta_value "$nm" MAXAGENT_HIDDEN)" = 1 ] && ! grep -qxF "$nm" <<<"$names"; then
+      hidden="${hidden}${nm}"$'\n'
+    fi
+  done
+  if [ -z "$names" ] && [ -z "$hidden" ]; then echo "No ${APP} sessions."; return; fi
   echo "${APP} sessions:"
   while IFS= read -r nm; do
     if [ -z "$nm" ]; then
@@ -335,6 +411,13 @@ _list(){
     fi
     printf '  %2d) %-22s [%s]\n' "$i" "$nm" "$tags"
   done <<< "$names"
+  if [ -n "$hidden" ]; then
+    echo "hidden:"
+    while IFS= read -r nm; do
+      [ -n "$nm" ] || continue
+      printf '      %-22s [%s panes]\n' "$nm" "$(_meta_value "$nm" MAXAGENT_PANES)"
+    done <<< "$hidden"
+  fi
   echo
   echo "Attach: $APP attach <number>    Close: $APP close <number>    GC: $APP prune"
 }
@@ -380,7 +463,13 @@ _main(){
       tgt="$(_resolve_list_index "$tgt")" || return $?
       _close "$tgt"
       return ;;
-    attach|a|re|reattach)
+    hide)
+      tgt="${2:-${ZELLIJ_SESSION_NAME:-}}"
+      [ -n "$tgt" ] || { echo "usage: $APP hide <number|name>  (no arg = current session)" >&2; _list; return 2; }
+      tgt="$(_resolve_list_index "$tgt")" || return $?
+      _hide "$tgt"
+      return ;;
+    attach|a|re|reattach|unhide)
       tgt="${2:-}"
       [ -n "$tgt" ] || { echo "usage: $APP attach <number|name>" >&2; _list; return 2; }
       tgt="$(_resolve_list_index "$tgt")" || return $?
@@ -388,12 +477,11 @@ _main(){
         # Known but not live: recreate then attach (create-or-attach), matching
         # the old maxclaude behavior instead of erroring on a dead session.
         if _has_systemd; then
-          loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-          systemctl --user start "$(_unit_for "$tgt")" >/dev/null 2>&1 \
-            || { echo "Failed to start $(_unit_for "$tgt"):" >&2; systemctl --user status "$(_unit_for "$tgt")" --no-pager | head -n 10; return 1; }
+          _start_unit "$tgt" || return 1
         else
-          tgt_panes="$(_meta_value "$tgt" MAXAGENT_PANES 2>/dev/null || echo 4)"
-          case "$tgt_panes" in 1|2|3|4) ;; *) tgt_panes=4 ;; esac
+          _clear_hidden "$tgt"
+          tgt_panes="$(_meta_value "$tgt" MAXAGENT_PANES 2>/dev/null || echo 1)"
+          case "$tgt_panes" in 1|2|3|4) ;; *) tgt_panes=1 ;; esac
           exec "$MAXAGENT_ZELLIJ" --layout "agent${tgt_panes}" attach -c "$tgt"
         fi
       fi
@@ -404,11 +492,11 @@ _main(){
   if [ -n "$sel" ] && _is_provider "$sel"; then
     provider="$sel"
     shift
-    sel="${1:-4}"
+    sel="${1:-1}"
   else
-    sel="${sel:-4}"
+    sel="${sel:-1}"
   fi
-  _open "$provider" "$sel" "${2:-4}" "$yolo"
+  _open "$provider" "$sel" "${2:-}" "$yolo"
 }
 
 _main "$@"

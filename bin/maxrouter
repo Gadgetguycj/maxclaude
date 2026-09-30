@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# maxrouter: user entrypoint. Bare invocation opens (create-or-attach) the
+# persistent "router" zellij session whose single pane runs claude inside
+# <config>/router, picking up that dir's CLAUDE.md as the router brain.
+set -euo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+ZJ="$HOME/.local/bin/zellij"
+if [ ! -x "$ZJ" ]; then ZJ="$(command -v zellij || echo zellij)"; fi
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+die(){ echo "maxrouter: $*" >&2; exit 1; }
+
+usage(){
+  cat <<'EOF'
+usage: maxrouter                    open (create-or-attach) the router session
+       maxrouter status             mxr status
+       maxrouter web start|stop|status
+       maxrouter notify start|stop|status    reply bridge (push worker replies, no polling)
+       maxrouter blockd start|stop|status    block watcher (push [worker-blocked] prompts)
+       maxrouter heartbeat start|stop|status heartbeat watcher (long-turn heartbeats/alerts)
+EOF
+}
+
+cmd_open(){
+  mkdir -p "$MXR_HOME/router/outbox" "$MXR_HOME/sessions"
+  {
+    printf 'MAXCLAUDE_WORKDIR=%s\n' "$MXR_HOME/router"
+    # router needs no MCP servers; silences the "setup issues: MCP" banner
+    printf 'MAXCLAUDE_EXTRA_ARGS=--strict-mcp-config\n'
+  } > "$MXR_HOME/sessions/router.env"
+  printf '1\n' > "$MXR_HOME/router.panes"
+  # pre-accept claude's trust dialog for the router dir (fresh installs wedge on it)
+  "$BIN_DIR/mxr" trust "$MXR_HOME/router" || true
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+  if ! systemctl --user start maxclaude-named@router.service; then
+    systemctl --user status maxclaude-named@router.service --no-pager | head >&2
+    die "failed to start maxclaude-named@router.service"
+  fi
+  # event bridge: pushes worker outbox replies into this pane so the router
+  # never has to poll on a timer. Best-effort; falls back to a bare background
+  # watcher when systemd --user is unavailable.
+  if ! systemctl --user start maxrouter-notify.service 2>/dev/null; then
+    if ! pgrep -f 'mxr-notifyd' >/dev/null 2>&1; then
+      ( "$BIN_DIR/mxr-notifyd" >/dev/null 2>&1 & disown ) || true
+    fi
+  fi
+  # block watcher: pushes [worker-blocked] the instant a worker pane freezes on
+  # an interactive prompt, so a stuck worker never hangs silently.
+  if ! systemctl --user start maxrouter-blockd.service 2>/dev/null; then
+    if ! pgrep -f 'mxr-blockd' >/dev/null 2>&1; then
+      ( "$BIN_DIR/mxr-blockd" >/dev/null 2>&1 & disown ) || true
+    fi
+  fi
+  # heartbeat watcher: still-working heartbeats + >30m alerts + orphan capture
+  # for long headless turns, so a multi-hour turn never goes silent.
+  if ! systemctl --user start maxrouter-heartbeat.service 2>/dev/null; then
+    if ! pgrep -f 'mxr-heartbeatd' >/dev/null 2>&1; then
+      ( "$BIN_DIR/mxr-heartbeatd" >/dev/null 2>&1 & disown ) || true
+    fi
+  fi
+  if [ -t 0 ] && [ -z "${ZELLIJ:-}" ]; then
+    exec "$ZJ" attach router
+  fi
+  echo "router session running; attach with: maxclaude attach router"
+}
+
+case "${1:-open}" in
+  open) cmd_open ;;
+  status) exec "$BIN_DIR/mxr" status "${@:2}" ;;
+  web)
+    case "${2:-status}" in
+      start)  systemctl --user start maxrouter-web.service && echo "maxrouter-web: started" ;;
+      stop)   systemctl --user stop maxrouter-web.service && echo "maxrouter-web: stopped" ;;
+      status) systemctl --user is-active maxrouter-web.service || true ;;
+      *) usage >&2; die "unknown web subcommand: ${2:-}" ;;
+    esac
+    ;;
+  notify)
+    case "${2:-status}" in
+      start)  systemctl --user start maxrouter-notify.service && echo "maxrouter-notify: started" ;;
+      stop)   systemctl --user stop maxrouter-notify.service && echo "maxrouter-notify: stopped" ;;
+      status) systemctl --user is-active maxrouter-notify.service || true ;;
+      *) usage >&2; die "unknown notify subcommand: ${2:-}" ;;
+    esac
+    ;;
+  blockd)
+    case "${2:-status}" in
+      start)  systemctl --user start maxrouter-blockd.service && echo "maxrouter-blockd: started" ;;
+      stop)   systemctl --user stop maxrouter-blockd.service && echo "maxrouter-blockd: stopped" ;;
+      status) systemctl --user is-active maxrouter-blockd.service || true ;;
+      *) usage >&2; die "unknown blockd subcommand: ${2:-}" ;;
+    esac
+    ;;
+  heartbeat)
+    case "${2:-status}" in
+      start)  systemctl --user start maxrouter-heartbeat.service && echo "maxrouter-heartbeat: started" ;;
+      stop)   systemctl --user stop maxrouter-heartbeat.service && echo "maxrouter-heartbeat: stopped" ;;
+      status) systemctl --user is-active maxrouter-heartbeat.service || true ;;
+      *) usage >&2; die "unknown heartbeat subcommand: ${2:-}" ;;
+    esac
+    ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; die "unknown command: $1" ;;
+esac
