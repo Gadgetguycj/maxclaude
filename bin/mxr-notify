@@ -33,8 +33,13 @@ else
 fi
 ZJ="$HOME/.local/bin/zellij"; [ -x "$ZJ" ] || ZJ="$(command -v zellij || echo zellij)"
 
-# zellij must never see the caller's ZELLIJ_* env or it grafts onto that session
-zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
+# zellij's own session discovery waits on every session's server with no time
+# limit. Every call goes through maxagent-zj, which sends it to the router's
+# server alone under a deadline and names a router that stopped answering.
+MZ="$(cd "$(dirname "$0")" && pwd)/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "mxr-notify: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2; exit 127; }
+mz(){ MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" "$@"; }
 
 kind=reply
 case "${1:-}" in
@@ -62,10 +67,15 @@ outfile="$OUTBOX/$sid.json"
 # typed input, so a push is an injection vector).
 prov="[provenance sid=$sid outbox=$outfile cfg=$MXR_HOME]"
 
-# no-op unless the target router session is actually live
-live="$(zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
-        | grep -vi EXITED | awk 'NF{print $1}')"
-grep -qxF "$ROUTER_SESSION" <<<"$live" || exit 0
+# no-op unless the target router session is actually live; a router whose
+# server stopped answering is reported and the push fails
+case "$(mz state "$ROUTER_SESSION" 2>/dev/null)" in
+  live) ;;
+  stuck)
+    echo "mxr-notify: router session '$ROUTER_SESSION' is not responding (its zellij server stopped answering); the push for '$task' was not delivered. End it with: maxclaude close $ROUTER_SESSION" >&2
+    exit 69 ;;
+  *) exit 0 ;;
+esac
 
 if [ "$kind" = raw ]; then
   msg="$payload  $prov"
@@ -85,7 +95,11 @@ else
 fi
 
 # bracketed paste keeps newlines/quotes from mis-firing; then Enter (13) submits
-zj --session "$ROUTER_SESSION" action write-chars -p terminal_0 \
-   $'\e[200~'"$msg"$'\e[201~' 2>/dev/null || exit 0
-zj --session "$ROUTER_SESSION" action write -p terminal_0 13 2>/dev/null || exit 0
+rc=0
+mz run "$ROUTER_SESSION" action write-chars -p terminal_0 $'\e[200~'"$msg"$'\e[201~' || rc=$?
+[ "$rc" = 0 ] && { mz run "$ROUTER_SESSION" action write -p terminal_0 13 || rc=$?; }
+if [ "$rc" = 69 ]; then
+  echo "mxr-notify: router session '$ROUTER_SESSION' is not responding; the push for '$task' was not delivered" >&2
+  exit 69
+fi
 exit 0

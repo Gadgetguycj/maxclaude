@@ -33,6 +33,7 @@ report a long-running task as making progress, use the live checks:
   - **IDLE**: alive but waiting at its prompt / resting between sends. Normal. Safe to send to.
   - **STALLED**: looked busy but stopped progressing (frozen pane, cold transcript). Investigate: `mxr peek <task>`; it may be wedged on a dialog.
   - **DEAD**: a paned task whose zellij session or claude process is gone. Tell the user; `mxr close` then `mxr open` re-establishes the pane.
+  - **STUCK**: a paned task whose zellij server stopped answering. `mxr send` refuses it. Tell the user; `mxr close <task>` ends the pane and keeps the conversation, then `mxr open` re-establishes it.
   - **NEW**: never sent to yet.
   Use `mxr health --json` when you want to reason over the result programmatically.
 - `mxr peek <task>`: dump what a paned worker's screen shows RIGHT NOW, without attaching (add `-n N` for more lines). This is how you see a worker's in-progress output. Headless tasks have no screen: use `mxr log` for them.

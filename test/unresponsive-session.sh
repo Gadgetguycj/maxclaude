@@ -5,15 +5,18 @@
 # not hang maxclaude/maxagent. The launcher must return promptly, name the
 # stuck session, keep the healthy session attachable, end the stuck one on
 # request, and hide a stuck session by ending its server. The units' stop
-# command must end a server that stopped answering since the last check.
+# command must end a server that stopped answering since the last check, and a
+# server that accepted the request to end and then stalled while shutting down.
 #
-# It reproduces the failure by stopping three servers with SIGSTOP. zellij runs in
+# It reproduces the failure by stopping three servers with SIGSTOP, and the
+# stalled shutdown by delaying a server's file deletions with strace. zellij runs in
 # a private socket, cache and config directory, and systemctl --user is cut off,
 # so no real session or unit is touched.
 #
 #   test/unresponsive-session.sh <dir with maxclaude, maxclaude-svc, maxagent, maxagent-zj>
 #
-# Needs Linux, zellij, and script(1) from util-linux. Exits non-zero on failure.
+# Needs Linux, zellij, and script(1) from util-linux. The stalled-shutdown case
+# also needs strace and is skipped without it. Exits non-zero on failure.
 
 set -uo pipefail
 
@@ -36,15 +39,19 @@ OK=mzt-ok
 STUCK=mzt-stuck
 HIDE=mzt-hide
 SVC=mzt-svc
+WEDGE=mzt-wedge
 FAILS=0
 STUCK_PID=""
 HIDE_PID=""
 SVC_PID=""
 OK_PID=""
+WEDGE_PID=""
+STRACE_PID=""
 
 cleanup(){
+  [ -n "$STRACE_PID" ] && kill "$STRACE_PID" 2>/dev/null
   for p in $STUCK_PID $HIDE_PID $SVC_PID; do kill -CONT "$p" 2>/dev/null; done
-  for p in $STUCK_PID $HIDE_PID $SVC_PID $OK_PID; do kill -KILL "$p" 2>/dev/null; done
+  for p in $STUCK_PID $HIDE_PID $SVC_PID $OK_PID $WEDGE_PID; do kill -KILL "$p" 2>/dev/null; done
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -84,9 +91,10 @@ OK_PID="$(start_session "$OK")"
 STUCK_PID="$(start_session "$STUCK")"
 HIDE_PID="$(start_session "$HIDE")"
 SVC_PID="$(start_session "$SVC")"
-[ -n "$OK_PID" ] && [ -n "$STUCK_PID" ] && [ -n "$HIDE_PID" ] && [ -n "$SVC_PID" ] || { echo "could not start test sessions" >&2; exit 2; }
+WEDGE_PID="$(start_session "$WEDGE")"
+[ -n "$OK_PID" ] && [ -n "$STUCK_PID" ] && [ -n "$HIDE_PID" ] && [ -n "$SVC_PID" ] && [ -n "$WEDGE_PID" ] || { echo "could not start test sessions" >&2; exit 2; }
 sleep 1
-echo "test sessions: $OK (pid $OK_PID), $STUCK (pid $STUCK_PID), $HIDE (pid $HIDE_PID), $SVC (pid $SVC_PID)"
+echo "test sessions: $OK (pid $OK_PID), $STUCK (pid $STUCK_PID), $HIDE (pid $HIDE_PID), $SVC (pid $SVC_PID), $WEDGE (pid $WEDGE_PID)"
 kill -STOP "$STUCK_PID" "$HIDE_PID"
 echo "stopped $STUCK server pid $STUCK_PID and $HIDE server pid $HIDE_PID with SIGSTOP"
 
@@ -158,6 +166,37 @@ if kill -0 "$SVC_PID" 2>/dev/null; then fail "$SVC server (pid $SVC_PID) still r
 run "maxagent-zj stop $OK" stop.out "$BIN/maxagent-zj" stop "$OK" && pass "stop $OK returned 0" || fail "stop $OK failed"
 grep -q SIGKILL "$T/stop.out" && fail "stop $OK needed SIGKILL" || pass "stop $OK ended without SIGKILL"
 kill -0 "$OK_PID" 2>/dev/null && fail "$OK server still runs after stop" || { pass "$OK server exited"; OK_PID=""; }
+
+# 8. The units' stop command ends a server that accepted the request to end and
+# then stalled while shutting down, the way a broken plugin stalled one. strace
+# delays the server's unlink calls by 120 s. Servers left over from failed
+# checks above are ended first so this check stands on its own.
+if command -v strace >/dev/null 2>&1; then
+  for p in $STUCK_PID $HIDE_PID $SVC_PID; do kill -KILL "$p" 2>/dev/null; done
+  STUCK_PID="" HIDE_PID="" SVC_PID=""
+  for s in "$STUCK" "$HIDE" "$SVC"; do rm -f "$SOCK_DIR/$s" "$XDG_RUNTIME_DIR/zellij/stuck/$s"; done
+  strace -f -p "$WEDGE_PID" -e trace=unlink,unlinkat,rmdir -e inject=unlink,unlinkat,rmdir:delay_enter=120s -o /dev/null &
+  STRACE_PID=$!
+  sleep 1.5
+  echo "$WEDGE server pid $WEDGE_PID; strace (pid $STRACE_PID) delays its unlink calls by 120 s"
+  run "maxclaude-svc stop $WEDGE" wedge.out "$BIN/maxclaude-svc" stop "$WEDGE" && pass "maxclaude-svc stop $WEDGE returned 0" || fail "maxclaude-svc stop $WEDGE failed or did not return"
+  sleep 1
+  st="$(ps -o stat= -p "$WEDGE_PID" 2>/dev/null | tr -d ' ')"
+  case "$st" in
+    ''|Z*) pass "$WEDGE server (pid $WEDGE_PID) exited after stop returned" ;;
+    *) fail "$WEDGE server (pid $WEDGE_PID) still runs after stop returned (state $st)" ;;
+  esac
+  grep -q SIGKILL "$T/wedge.out" && pass "stop $WEDGE reported the SIGKILL" || fail "stop $WEDGE did not report a SIGKILL"
+  [ ! -e "$SOCK_DIR/$WEDGE" ] && pass "no socket left for $WEDGE" || fail "a socket for $WEDGE is left behind"
+  # No session is left, so zellij answers "No active zellij sessions found." with exit 1.
+  run "zellij list-sessions after stop $WEDGE" zls2.out "$ZJ" list-sessions -n
+  rc=$?
+  [ "$rc" != 137 ] && pass "zellij list-sessions answers after the stalled shutdown (exit $rc)" || fail "zellij list-sessions hangs after the stalled shutdown"
+  kill "$STRACE_PID" 2>/dev/null
+  STRACE_PID=""
+else
+  echo "SKIP: strace not found; the stalled-shutdown case was not run"
+fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL ($FAILS checks failed)"; fi

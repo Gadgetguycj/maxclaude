@@ -58,12 +58,25 @@ ensure_home(){
 # would silently graft a tab onto that session instead (spike-proven)
 zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
 
+# zellij's own session discovery waits on every session's server with no time
+# limit, so one server that stops answering would hang mxr. Listing and every
+# call into a session go through maxagent-zj, which bounds each call and names
+# a session whose server stopped answering (exit 69 from `run`).
+MZ="$(cd "$(dirname "$0")" && pwd)/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "mxr: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2; exit 127; }
+mz(){ MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" "$@"; }
+
 live_sessions(){
-  zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+  mz list -n 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep -vi 'EXITED' | awk 'NF{print $1}' || true
 }
 
 session_live(){ live_sessions | grep -qxF "task-$1"; }
+
+# Sessions whose zellij server stopped answering: name, server pid, time set aside.
+stuck_sessions(){ mz stuck 2>/dev/null || true; }
+session_stuck(){ stuck_sessions | cut -f1 | grep -qxF "task-$1"; }
 
 resolve_org(){ # $1 = name-or-alias (case-insensitive) -> "Name<TAB>workdir"
   if [ ! -f "$MXR_HOME/orgs.json" ]; then return 1; fi
@@ -246,10 +259,17 @@ send_paned(){
   # DELIVERY: bracketed paste keeps arbitrary text (newlines, quotes) from
   # mis-firing. A failure HERE is a real delivery error (exit 1); a reply
   # timeout AFTER successful delivery is NOT an error (INCIDENT 2026-08-02).
-  if ! zj --session "$sess" action write-chars -p terminal_0 $'\e[200~'"$MSG"$'\e[201~' 2>/dev/null \
-     || ! zj --session "$sess" action write -p terminal_0 13 2>/dev/null; then
-    echo "mxr: DELIVERY FAILED to pane task-$T_NAME (session gone mid-send?)" >&2
-    log_line "$T_NAME" "$T_ORG" router "paned delivery FAILED"
+  local rc=0
+  mz run "$sess" action write-chars -p terminal_0 $'\e[200~'"$MSG"$'\e[201~' || rc=$?
+  [ "$rc" = 0 ] && { mz run "$sess" action write -p terminal_0 13 || rc=$?; }
+  if [ "$rc" != 0 ]; then
+    if [ "$rc" = 69 ]; then
+      echo "mxr: DELIVERY FAILED: pane session task-$T_NAME is not responding (its zellij server stopped answering). End it with: mxr close $T_NAME" >&2
+      log_line "$T_NAME" "$T_ORG" router "paned delivery FAILED: pane session not responding"
+    else
+      echo "mxr: DELIVERY FAILED to pane task-$T_NAME (session gone mid-send?)" >&2
+      log_line "$T_NAME" "$T_ORG" router "paned delivery FAILED"
+    fi
     return 1
   fi
   if [ "$ASYNC" = 1 ]; then
@@ -330,12 +350,12 @@ pane_state(){ # $1 = session -> blocked|working|idle|unknown (from the live TUI 
   # its spinner and token/second counters, so two dumps ~0.5s apart DIFFER; a
   # pane parked at the `❯` prompt is byte-for-byte static.
   local a b
-  a="$(zj --session "$1" action dump-screen -p terminal_0 2>/dev/null \
+  a="$(mz run "$1" action dump-screen -p terminal_0 2>/dev/null \
        | sed -E 's/\x1b\[[0-9;]*m//g')" || { echo unknown; return; }
   if [ -z "$a" ]; then echo unknown; return; fi
   if grep -qiE 'esc to interrupt' <<<"$a"; then echo working; return; fi
   sleep 0.5
-  b="$(zj --session "$1" action dump-screen -p terminal_0 2>/dev/null \
+  b="$(mz run "$1" action dump-screen -p terminal_0 2>/dev/null \
        | sed -E 's/\x1b\[[0-9;]*m//g')" || { echo unknown; return; }
   if [ "$a" != "$b" ]; then echo working; return; fi
   # static now. A real modal shows the BLOCK_SIG with NO normal input/spinner
@@ -368,6 +388,11 @@ task_state(){
   local active_window=20
   G_PID="${pid:--}"; G_AGE="$age"; G_NOTE=""
   if [ "$T_MODE" = paned ]; then
+    if [ "$live" = 0 ] && session_stuck "$T_NAME"; then
+      G_STATE=STUCK
+      G_NOTE="pane session $sess is not responding (zellij server pid $(stuck_sessions | awk -F'\t' -v s="$sess" '$1 == s {print $2}')); end it with: mxr close $T_NAME"
+      return
+    fi
     if [ "$live" = 0 ]; then
       G_STATE=DEAD; G_NOTE="registry mode=paned but zellij session gone"; return
     fi
@@ -438,6 +463,9 @@ cmd_peek(){
     load_task "$name"
     sess="task-$name"
     if [ "$T_MODE" != paned ] || ! session_live "$name"; then
+      if [ "$T_MODE" = paned ] && session_stuck "$name"; then
+        echo "mxr: pane session task-$name is not responding (its zellij server stopped answering); showing its transcript. End it with: mxr close $name" >&2
+      fi
       # headless (or pane down): no screen: tail the session transcript by sid,
       # so "what is X doing right now" works with no pane (INCIDENT 2026-08-02).
       local tp; tp="$(transcript_path "$T_WD" "$T_SID")"
@@ -450,7 +478,7 @@ cmd_peek(){
     fi
   fi
   local scr
-  scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null)" \
+  scr="$(mz run "$sess" action dump-screen -p terminal_0)" \
     || die "could not dump screen for session '$sess' (running? try: mxr status)"
   if [ "$raw" = 1 ]; then printf '%s\n' "$scr" | tail -n "$n"
   else printf '%s\n' "$scr" | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n "$n"; fi
@@ -478,7 +506,7 @@ cmd_watch(){
       "$name" "$T_MODE" "$G_STATE" "$(human_age "$G_AGE")" "$G_PID" "$(now)"
     printf -- '-- ctrl-c to stop, refresh %ss --\n' "$i"
     if [ "$T_MODE" = paned ] && session_live "$name"; then
-      zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null \
+      mz run "$sess" action dump-screen -p terminal_0 \
         | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n "$n"
     elif [ -f "$tp" ]; then
       transcript_text "$tp" | tail -n "$n"
@@ -580,7 +608,10 @@ cmd_notify(){ # manual re-poke the router about a task's latest reply
   local nb
   nb="$(dirname "$0")/mxr-notify"
   [ -x "$nb" ] || nb="$HOME/.local/bin/mxr-notify"
-  "$nb" reply "$T_SID" || true
+  if ! "$nb" reply "$T_SID"; then
+    echo "mxr: the router was not poked about $name; see the message above" >&2
+    return 1
+  fi
   echo "poked router about $name (sid $T_SID)"
 }
 
@@ -688,7 +719,13 @@ cmd_send(){
   load_task "$name"
   if [ "$T_STATUS" != "active" ]; then die "task $name is archived"; fi
   log_line "$T_NAME" "$T_ORG" "user->task" "$MSG"
+  # session_live sets aside a server that stopped answering, so session_stuck
+  # is only asked after it.
   if [ "$T_MODE" = "paned" ] && ! session_live "$T_NAME"; then
+    if session_stuck "$T_NAME"; then
+      log_line "$T_NAME" "$T_ORG" router "send refused: pane session not responding"
+      die "pane session task-$T_NAME is not responding (its zellij server stopped answering), so the message was not sent. End it with: mxr close $T_NAME, then send again"
+    fi
     echo "mxr: pane session task-$T_NAME is not running; demoting to headless" >&2
     reg_set_field "$T_NAME" mode headless
     T_MODE=headless
@@ -757,6 +794,11 @@ cmd_open(){
     echo "task $name already paned; attach: maxclaude attach $sess"
     return 0
   fi
+  # session_live set aside a server that stopped answering; never start a
+  # second session under its name.
+  if session_stuck "$name"; then
+    die "pane session $sess is not responding (its zellij server stopped answering). End it with: mxr close $name, then open again"
+  fi
   pretrust_dir "$T_WD"
   loginctl enable-linger "$USER" >/dev/null 2>&1 || true
   local esc
@@ -768,7 +810,7 @@ cmd_open(){
   # readiness: single-pane layouts always expose terminal_0
   local i scr ready=0 answered_resume=0
   for i in $(seq 1 30); do
-    scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' || true)"
+    scr="$(mz run "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' || true)"
     if grep -q 'bypass permissions on' <<<"$scr" && grep -q '❯' <<<"$scr"; then
       ready=1; break
     fi
@@ -779,7 +821,7 @@ cmd_open(){
     if [ "$answered_resume" = 0 ] \
        && grep -qE "$BLOCK_SIG" <<<"$scr" \
        && grep -qiE 'resume|summary|compact|previous conversation|continue where' <<<"$scr"; then
-      zj --session "$sess" action write -p terminal_0 13 >/dev/null 2>&1 || true
+      mz run "$sess" action write -p terminal_0 13 >/dev/null 2>&1 || true
       log_line "$T_NAME" "$T_ORG" router "pre-answered resume-from-summary menu (default) on open"
       answered_resume=1
     fi
@@ -799,7 +841,7 @@ cmd_close(){
   local esc
   esc="$(systemd-escape "task-$name")"
   systemctl --user disable --now "maxclaude-named@${esc}.service" >/dev/null 2>&1 || true
-  zj delete-session --force "task-$name" >/dev/null 2>&1 || true
+  mz stop "task-$name" >/dev/null || echo "mxr: could not confirm that pane session task-$name ended; see the message above" >&2
   reg_set_field "$T_NAME" mode headless
   echo "task $name demoted to headless (conversation kept, sid $T_SID)"
 }
@@ -810,7 +852,7 @@ cmd_archive(){
   local esc
   esc="$(systemd-escape "task-$name")"
   systemctl --user disable --now "maxclaude-named@${esc}.service" >/dev/null 2>&1 || true
-  zj delete-session --force "task-$name" >/dev/null 2>&1 || true
+  mz stop "task-$name" >/dev/null || echo "mxr: could not confirm that pane session task-$name ended; see the message above" >&2
   reg_set_field "$T_NAME" mode headless
   reg_set_field "$T_NAME" status archived
   log_line "$T_NAME" "$T_ORG" router "task archived"
@@ -837,22 +879,29 @@ cmd_log(){
 cmd_status(){
   local as_json=0
   if [ "${1:-}" = "--json" ]; then as_json=1; fi
-  local sessions router_live=false router_unit web_unit
+  local sessions stuck router_live=false router_unit web_unit
   sessions="$(live_sessions)"
+  stuck="$(stuck_sessions)"
   if grep -qxF router <<<"$sessions"; then router_live=true; fi
   router_unit="$(systemctl --user is-active maxclaude-named@router.service 2>/dev/null || true)"
   web_unit="$(systemctl --user is-active maxrouter-web.service 2>/dev/null || true)"
   if [ "$as_json" = 1 ]; then
     jq -n --slurpfile reg "$REG" --arg sess "$sessions" --argjson rl "$router_live" \
-       --arg ru "${router_unit:-unknown}" --arg wu "${web_unit:-unknown}" '
+       --arg ru "${router_unit:-unknown}" --arg wu "${web_unit:-unknown}" --arg stuck "$stuck" '
       {tasks: ($reg[0].tasks // {}),
        sessions: ($sess | split("\n") | map(select(length > 0))),
+       not_responding: ($stuck | split("\n") | map(select(length > 0) | split("\t")
+                        | {session: .[0], server_pid: .[1], since: .[2]})),
        router: {session_live: $rl, unit: $ru},
        web: {unit: $wu}}'
   else
     cmd_tasks
     echo
     echo "zellij sessions: $(tr '\n' ' ' <<<"$sessions")"
+    if [ -n "$stuck" ]; then
+      echo "not responding (end with: maxclaude close <name>):"
+      awk -F'\t' 'NF {printf "  %s  zellij server pid %s, stopped answering by %s\n", $1, ($2 == "" ? "unknown" : $2), ($3 == "" ? "?" : $3)}' <<<"$stuck"
+    fi
     echo "router: session_live=$router_live unit=${router_unit:-unknown}"
     echo "web:    unit=${web_unit:-unknown}"
   fi

@@ -60,7 +60,16 @@ cmd_open(){
     fi
   fi
   if [ -t 0 ] && [ -z "${ZELLIJ:-}" ]; then
-    exec "$ZJ" attach router
+    # zellij attach waits on every session's server; check the router first so a
+    # server that stopped answering is named instead of hanging the terminal.
+    MZ="$BIN_DIR/maxagent-zj"
+    [ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+    [ -n "$MZ" ] || die "maxagent-zj not found next to $0. Re-run the installer (install.sh)."
+    case "$(MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" state router)" in
+      live) exec "$ZJ" attach router ;;
+      stuck) die "router session is not responding (its zellij server stopped answering). End it with: maxclaude close router, then run maxrouter again" ;;
+      *) die "router session did not come up; see: systemctl --user status maxclaude-named@router.service" ;;
+    esac
   fi
   echo "router session running; attach with: maxclaude attach router"
 }

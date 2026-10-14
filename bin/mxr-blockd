@@ -20,7 +20,14 @@ BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 NOTIFY="$BIN_DIR/mxr-notify"
 INTERVAL="${MXR_BLOCK_INTERVAL:-3}"
 ZJ="$HOME/.local/bin/zellij"; [ -x "$ZJ" ] || ZJ="$(command -v zellij || echo zellij)"
-zj(){ env -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID "$ZJ" "$@"; }
+# zellij's own session discovery waits on every session's server with no time
+# limit. Listing and screen dumps go through maxagent-zj, which bounds each call
+# and sets aside a server that stopped answering.
+MZ="$BIN_DIR/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "mxr-blockd: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2; exit 127; }
+mz(){ MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" "$@"; }
+STUCK_SEEN=""
 
 mkdir -p "$BLOCKED_DIR"
 [ -x "$NOTIFY" ] || { echo "mxr-blockd: $NOTIFY not executable" >&2; exit 127; }
@@ -42,8 +49,20 @@ BLOCK_SIG='❯ [0-9]+\.|Enter to select|to navigate|to cancel|Do you trust the f
 LIVE_AFFORDANCE='bypass permissions on|shift\+tab to cycle|esc to interrupt'
 
 live_task_sessions(){
-  zj list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
+  mz list -n 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep -vi EXITED | awk 'NF{print $1}' | grep '^task-' || true
+}
+
+# Name each worker pane whose zellij server stopped answering, once while it stays stuck.
+report_stuck(){
+  local now="" name pid
+  while IFS=$'\t' read -r name pid _; do
+    case "$name" in task-*) ;; *) continue ;; esac
+    now="$now $name"
+    case " $STUCK_SEEN " in *" $name "*) continue ;; esac
+    echo "mxr-blockd: worker pane $name is not responding (zellij server pid ${pid:-unknown}); not scanned. End it with: mxr close ${name#task-}" >&2
+  done < <(mz stuck 2>/dev/null || true)
+  STUCK_SEEN="$now"
 }
 
 # extract the question + options from a screen (chrome/box-draw stripped)
@@ -61,7 +80,7 @@ while :; do
   while IFS= read -r sess; do
     [ -n "$sess" ] || continue
     seen="$seen $sess"
-    scr="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || continue
+    scr="$(mz run "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || continue
     [ -n "$scr" ] || continue
     marker="$BLOCKED_DIR/$sess"
     blocked=0
@@ -70,7 +89,7 @@ while :; do
       # ...and STATIC (a real modal is frozen; a working pane rendering menu text
       # in scrollback keeps animating). Confirms with one 0.5s re-dump.
       sleep 0.5
-      scr2="$(zj --session "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || scr2=""
+      scr2="$(mz run "$sess" action dump-screen -p terminal_0 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g')" || scr2=""
       [ -n "$scr2" ] && [ "$scr" = "$scr2" ] && blocked=1
     fi
     if [ "$blocked" = 1 ]; then
@@ -87,6 +106,7 @@ while :; do
       [ -f "$marker" ] && rm -f "$marker"
     fi
   done < <(live_task_sessions)
+  report_stuck
   # prune markers for sessions that no longer exist
   for m in "$BLOCKED_DIR"/*; do
     [ -e "$m" ] || continue

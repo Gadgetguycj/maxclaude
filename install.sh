@@ -397,14 +397,21 @@ install -m 0755 "$SRC_DIR/bin/mxr-heartbeatd" "$BIN_DIR/mxr-heartbeatd"
 install -m 0755 "$SRC_DIR/bin/maxrouter-webd" "$BIN_DIR/maxrouter-webd"
 install -m 0755 "$SRC_DIR/bin/maxclaude-browser-reaper" "$BIN_DIR/maxclaude-browser-reaper"
 ok "commands  -> router tools, maxclaude-pane, and maxclaude-restore in $BIN_DIR"
-# Router pane path (maxclaude-named@ -> maxclaude-svc -> cc* layouts): install
-# only when missing so a live box's tuned copies are kept.
-if [ ! -x "$BIN_DIR/maxclaude-svc" ]; then
-  install -m 0755 "$SRC_DIR/bin/maxclaude-svc" "$BIN_DIR/maxclaude-svc"
-  ok "command   -> $BIN_DIR/maxclaude-svc"
-else
-  ok "command   -> $BIN_DIR/maxclaude-svc (kept)"
-fi
+# Replace an installed file, keeping a copy of it when it differs.
+replace_file(){
+  local mode="$1" src="$2" dst="$3" bak
+  if [ -f "$dst" ] && ! cmp -s "$src" "$dst"; then
+    bak="$dst.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$dst" "$bak"
+    ok "kept the previous $(basename "$dst") as $bak"
+  fi
+  install -m "$mode" "$src" "$dst"
+}
+# Router pane path (maxclaude-named@ -> maxclaude-svc -> cc* layouts).
+# maxclaude-svc is always replaced: an older copy can hang on a zellij server
+# that stopped answering and cannot confirm that a stopped session ended.
+replace_file 0755 "$SRC_DIR/bin/maxclaude-svc" "$BIN_DIR/maxclaude-svc"
+ok "command   -> $BIN_DIR/maxclaude-svc"
 cc_installed=""
 for n in 1 2 3 4; do
   if [ ! -f "$LAYOUT_DIR/cc${n}.kdl" ]; then
@@ -469,10 +476,9 @@ if [ -n "$USE_SYSTEMD" ]; then
   # Every minute, set aside a zellij server that stopped answering, so it cannot
   # hang zellij for the other sessions.
   install -m 0644 "$SRC_DIR/systemd/maxagent-zj-watch.service" "$SRC_DIR/systemd/maxagent-zj-watch.timer" "$UNIT_DIR/"
-  # maxclaude-named@ drives the router-mode sessions; keep a live box's copy.
-  if [ ! -f "$UNIT_DIR/maxclaude-named@.service" ]; then
-    install -m 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
-  fi
+  # maxclaude-named@ drives the router-mode sessions. It is always replaced:
+  # an older copy has no start or stop time limit.
+  replace_file 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/maxclaude-named@.service"
   systemctl --user daemon-reload 2>/dev/null || true
   # The event bridge is safe to run always (no-ops without a live router), so
   # enable it now: replies push to the router instead of it polling on a timer.

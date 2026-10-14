@@ -20,12 +20,14 @@ command -v systemd-escape >/dev/null 2>&1 || {
   exit 127
 }
 
-live_sessions(){
-  "$ZJ" list-sessions 2>/dev/null \
-    | sed -E $'s/\033\\[[0-9;]*m//g' \
-    | grep -vi EXITED \
-    | awk 'NF { print $1 }'
-}
+# zellij's own session discovery waits on every session's server with no time
+# limit, so the session checks go through maxagent-zj, which bounds them and
+# sets aside a server that stopped answering.
+MZ="$(cd "$(dirname "$0")" && pwd)/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "maxclaude-restore: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2; exit 127; }
+LIVE="$(MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" live)"
+STUCK="$(MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ" "$MZ" stuck | cut -f1)"
 
 transcript_path(){
   local workdir="$1" sid="$2" project
@@ -52,8 +54,12 @@ while IFS=$'\t' read -r name sid workdir panes _rest || [ -n "${name:-}" ]; do
   [ -f "$transcript" ] || { echo "SKIP $name: transcript missing" >&2; continue; }
   ( umask 077; printf 'MAXCLAUDE_WORKDIR=%s\nMAXCLAUDE_RESUME_SID=%s\n' "$workdir" "$sid" > "$CFG/sessions/${name}.env" )
   printf '%s\n' "$panes" > "$CFG/${name}.panes"
-  if live_sessions | grep -qxF "$name"; then
+  if grep -qxF "$name" <<<"$LIVE"; then
     echo "LIVE $name"
+    continue
+  fi
+  if grep -qxF "$name" <<<"$STUCK"; then
+    echo "STUCK $name: its zellij server stopped answering, so it was not started again. End it with: maxclaude close $name" >&2
     continue
   fi
   unit="maxclaude-named@$(systemd-escape "$name").service"
