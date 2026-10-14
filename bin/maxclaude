@@ -9,6 +9,18 @@ if [ ! -x "$MAXCLAUDE_ZELLIJ" ]; then
 fi
 [ -n "$MAXCLAUDE_ZELLIJ" ] || { echo "maxclaude: zellij not found" >&2; exit 127; }
 
+# Session discovery and teardown go through maxagent-zj, which asks each zellij
+# server on its own under a deadline. zellij's own discovery waits forever on a
+# server that stops answering, which would hang every command here.
+MZ="$BIN_DIR/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "maxclaude: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2; exit 127; }
+_mz(){ MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$MAXCLAUDE_ZELLIJ" "$MZ" "$@"; }
+
+_maxclaude_has_systemd(){
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
 _maxclaude_agent(){
   MAXAGENT_DEFAULT_PROVIDER=claude MAXAGENT_SESSION_PREFIX=legacy MAXAGENT_APP=maxclaude \
     "$BIN_DIR/maxagent" "$@"
@@ -35,12 +47,14 @@ _maxclaude_is_boot_enabled(){
 # prior login linger in the user manager's loaded set until the next reboot, but
 # they're inert/static and never surface in `maxclaude ls`.)
 _maxclaude_prune(){
-  local ZJ="$MAXCLAUDE_ZELLIJ" u inst name
-  local live; live="$("$ZJ" list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' \
-                       | grep -vi 'EXITED' | awk 'NF{print $1}')"
+  local u inst name live stuck
+  live="$(_maxclaude_sessions)"
+  # A stuck session is not gone: it is listed and left for the user to end.
+  stuck="$(_maxclaude_stuck_names)"
   # 1) drop EXITED zellij tombstones
-  "$ZJ" list-sessions 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' | grep -i 'EXITED' \
-    | awk 'NF{print $1}' | while read -r name; do "$ZJ" delete-session -f "$name" >/dev/null 2>&1; done
+  { _mz exited || true; } | while IFS= read -r name; do
+    [ -n "$name" ] && { _mz forget "$name" >/dev/null 2>&1 || true; }
+  done
   # 2) stop any ACTIVE maxclaude unit whose session is not live
   for u in $(systemctl --user list-units 'maxclaude@*' 'maxclaude-named@*' --no-legend 2>/dev/null | awk '{print $1}'); do
     inst="${u%.service}"
@@ -50,6 +64,7 @@ _maxclaude_prune(){
       *) continue ;;
     esac
     grep -qxF "$name" <<<"$live" && continue
+    grep -qxF "$name" <<<"$stuck" && continue
     systemctl --user stop "$u" >/dev/null 2>&1
     systemctl --user reset-failed "$u" >/dev/null 2>&1
   done
@@ -60,20 +75,34 @@ _maxclaude_prune(){
 # units are excluded. `maxclaude ls`/`attach`/`close` number this list, so the
 # indices always line up and never point at a dead session.
 _maxclaude_sessions(){
-  "$MAXCLAUDE_ZELLIJ" list-sessions 2>/dev/null \
-    | sed -E 's/\x1b\[[0-9;]*m//g' \
-    | grep -vi 'EXITED' \
-    | awk 'NF && !seen[$1]++{print $1}'
+  { _mz live || true; } | awk 'NF && !seen[$0]++'
 }
 
-# Close one session by name or number: stop its --user unit, then kill+delete it.
+# Sessions whose zellij server stopped answering (set aside by maxagent-zj).
+_maxclaude_stuck_names(){
+  { _mz stuck || true; } | cut -f1
+}
+
+# Refuse to open a session whose zellij server stopped answering. The check also
+# sets aside any such server, so the zellij attach that follows cannot hang on it.
+_maxclaude_refuse_stuck(){
+  [ "$(_mz state "$1")" = stuck ] || return 0
+  echo "maxclaude: session '$1' is not responding (its zellij server stopped answering)." >&2
+  echo "End it with: maxclaude close $1" >&2
+  return 1
+}
+
+# Close one session by name or number: stop its --user unit, then end its
+# zellij server and wait until it has exited.
 _maxclaude_close(){
-  local ZJ="$MAXCLAUDE_ZELLIJ" sess="$1"
+  local sess="$1"
   case "$sess" in [1-4]) sess="max${sess}" ;; esac
   # disable --now also clears any stray boot enablement, then stops the unit.
   systemctl --user disable --now "$(_maxclaude_unit_for "$sess")" >/dev/null 2>&1
-  "$ZJ" kill-session "$sess" >/dev/null 2>&1
-  "$ZJ" delete-session -f "$sess" >/dev/null 2>&1
+  if ! _mz stop "$sess"; then
+    echo "maxclaude: could not confirm that session '$sess' ended; see the message above." >&2
+    return 1
+  fi
   echo "Closed session: $sess."
 }
 
@@ -98,9 +127,15 @@ _maxclaude_open(){
   case "$sel" in
     1|2|3|4)
       local n="$sel"
-      loginctl enable-linger "$USER" >/dev/null 2>&1
-      systemctl --user start "maxclaude@${n}.service" >/dev/null 2>&1 \
-        || { echo "Failed to start maxclaude@${n}.service:" >&2; systemctl --user status "maxclaude@${n}.service" --no-pager | head; return 1; }
+      _maxclaude_refuse_stuck "max${n}" || return 1
+      if _maxclaude_has_systemd; then
+        loginctl enable-linger "$USER" >/dev/null 2>&1
+        systemctl --user start "maxclaude@${n}.service" >/dev/null 2>&1 \
+          || { echo "Failed to start maxclaude@${n}.service:" >&2; systemctl --user status "maxclaude@${n}.service" --no-pager | head; return 1; }
+      else
+        # No user manager: start it the way the unit does; zellij keeps it running.
+        "$BIN_DIR/maxclaude-svc" start "max${n}" "$n" || return 1
+      fi
       "$ZJ" attach "max${n}"
       return ;;
   esac
@@ -130,10 +165,16 @@ _maxclaude_open(){
         "${orgrow%%$'\t'*}" "${orgrow#*$'\t'}" > "$cfg/sessions/${safe}.env"
     fi
   fi
-  loginctl enable-linger "$USER" >/dev/null 2>&1
-  local esc; esc="$(systemd-escape "$safe")"
-  systemctl --user start "maxclaude-named@${esc}.service" >/dev/null 2>&1 \
-    || { echo "Failed to start maxclaude-named@${safe}.service:" >&2; systemctl --user status "maxclaude-named@${esc}.service" --no-pager | head; return 1; }
+  _maxclaude_refuse_stuck "$safe" || return 1
+  if _maxclaude_has_systemd; then
+    loginctl enable-linger "$USER" >/dev/null 2>&1
+    local esc; esc="$(systemd-escape "$safe")"
+    systemctl --user start "maxclaude-named@${esc}.service" >/dev/null 2>&1 \
+      || { echo "Failed to start maxclaude-named@${safe}.service:" >&2; systemctl --user status "maxclaude-named@${esc}.service" --no-pager | head; return 1; }
+  else
+    # No user manager: start it the way the unit does; zellij keeps it running.
+    "$BIN_DIR/maxclaude-svc" start "$safe" || return 1
+  fi
   "$ZJ" attach "$safe"
 }
 
@@ -151,9 +192,12 @@ _maxclaude_ephemeral(){
     return 1
   fi
   local name="tmp-$$"
+  # Set aside any zellij server that stopped answering, so the attach below
+  # cannot hang on it.
+  _mz live >/dev/null
   # Tear the session down even if the SSH connection drops: linger is on for this
   # user, so the detached zellij server would otherwise outlive the disconnect.
-  _maxclaude_ephemeral_cleanup(){ "$ZJ" delete-session --force "$name" >/dev/null 2>&1; }
+  _maxclaude_ephemeral_cleanup(){ _mz stop "$name" >/dev/null; }
   trap _maxclaude_ephemeral_cleanup HUP INT TERM
   "$ZJ" --layout cc1 attach --create "$name"
   trap - HUP INT TERM
@@ -169,7 +213,6 @@ _maxclaude_unhide_flag(){
 
 maxclaude(){
   export COLORTERM="${COLORTERM:-truecolor}"
-  local ZJ="$MAXCLAUDE_ZELLIJ"
   local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
 
   # No arguments -> a single, throwaway Claude pane that is never persisted (see
@@ -189,7 +232,8 @@ maxclaude(){
     ls|list)
       _maxclaude_prune                       # purge dead/exited ghosts before listing
       local names; names="$(_maxclaude_sessions)"
-      if [ -z "$names" ]; then echo "No maxclaude sessions."; return; fi
+      local stuck; stuck="$(_mz stuck || true)"
+      if [ -z "$names" ] && [ -z "$stuck" ]; then echo "No maxclaude sessions."; return; fi
       local i=0 nm tags orgtag
       echo "maxclaude sessions:"
       while IFS= read -r nm; do
@@ -207,9 +251,19 @@ maxclaude(){
         grep -qx 'MAXAGENT_HIDDEN=1' "$hidden_env" || continue
         hidden_nm="$(basename "$hidden_env" .env)"
         grep -qxF "$hidden_nm" <<<"$names" && continue
+        cut -f1 <<<"$stuck" | grep -qxF "$hidden_nm" && continue
         hidden_list="$hidden_list  $(printf '%-22s' "$hidden_nm") [$(grep -m1 '^MAXAGENT_PANES=' "$hidden_env" | cut -d= -f2-) panes]\n"
       done
       if [ -n "$hidden_list" ]; then echo "hidden:"; printf '%b' "$hidden_list"; fi
+      if [ -n "$stuck" ]; then
+        local stuck_pid stuck_since
+        echo "not responding (zellij cannot reach these; the sessions above are unaffected):"
+        while IFS=$'\t' read -r nm stuck_pid stuck_since; do
+          [ -n "$nm" ] || continue
+          printf '      %-22s [zellij server pid %s, stopped answering by %s]\n' "$nm" "${stuck_pid:-unknown}" "${stuck_since:-?}"
+        done <<< "$stuck"
+        echo "  End one with: maxclaude close <name>"
+      fi
       echo
       echo "Attach: maxclaude attach <number>    Close: maxclaude close <number>    Hide: maxclaude hide <number|name>"
       return ;;
@@ -225,8 +279,12 @@ maxclaude(){
         for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1; done
         systemctl --user list-units 'maxclaude-named@*' --all --no-legend 2>/dev/null | awk '{print $1}' \
           | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1; done
-        "$ZJ" kill-all-sessions -y >/dev/null 2>&1
-        "$ZJ" delete-all-sessions -y -f >/dev/null 2>&1
+        { _maxclaude_sessions; _maxclaude_stuck_names; } | while IFS= read -r n; do
+          [ -n "$n" ] && { _mz stop "$n" >/dev/null || true; }
+        done
+        { _mz exited || true; } | while IFS= read -r n; do
+          [ -n "$n" ] && { _mz forget "$n" >/dev/null 2>&1 || true; }
+        done
         echo "ALL maxclaude sessions stopped and removed from boot."
         return
       fi

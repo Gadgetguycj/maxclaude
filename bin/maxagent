@@ -344,8 +344,10 @@ _hide(){
     systemctl --user disable --now "$(_unit_for "$sess")" >/dev/null 2>&1 || true
     systemctl --user disable --now "$(_legacy_unit_for "$sess")" >/dev/null 2>&1 || true
   fi
-  "$MAXAGENT_ZELLIJ" kill-session "$sess" >/dev/null 2>&1 || true
-  "$MAXAGENT_ZELLIJ" delete-session -f "$sess" >/dev/null 2>&1 || true
+  if ! "$MZ" stop "$sess"; then
+    echo "$APP: could not confirm that session '$sess' ended; see the message above." >&2
+    return 1
+  fi
   echo "Hidden session: $sess. Bring it back with: $APP attach $sess"
 }
 
