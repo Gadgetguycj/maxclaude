@@ -22,8 +22,22 @@ elif [ "$action" = "start" ]; then
 fi
 case "$panes" in 1|2|3|4) ;; *) panes=4 ;; esac
 
+# Session checks and teardown go through maxagent-zj, so a zellij server that
+# stops answering cannot hang the unit.
+MZ="$(cd "$(dirname "$0")" && pwd)/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+[ -n "$MZ" ] || { echo "maxagent-svc: maxagent-zj not found" >&2; exit 127; }
+export MAXAGENT_ZELLIJ="$ZJ"
+
 case "$action" in
-  start) exec "$ZJ" --layout "agent${panes}" attach --create-background "$name" ;;
-  stop) exec "$ZJ" delete-session --force "$name" ;;
+  start)
+    case "$("$MZ" state "$name")" in
+      live) exit 0 ;;
+      stuck)
+        echo "maxagent-svc: session '$name' is not responding, so it was not started again. End it with: maxagent close $name" >&2
+        exit 1 ;;
+    esac
+    exec "$ZJ" --layout "agent${panes}" attach --create-background "$name" ;;
+  stop) exec "$MZ" stop "$name" ;;
   *) echo "unknown action: $action (want start|stop)" >&2; exit 2 ;;
 esac

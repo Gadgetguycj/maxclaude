@@ -46,6 +46,17 @@ if [ -n "$NEED_ZELLIJ" ] && [ ! -x "$MAXAGENT_ZELLIJ" ] && ! command -v "$MAXAGE
 fi
 
 export COLORTERM="${COLORTERM:-truecolor}"
+export MAXAGENT_APP="$APP" MAXAGENT_ZELLIJ
+
+# Session discovery and teardown go through maxagent-zj, which asks each zellij
+# server on its own under a deadline. zellij's own discovery waits forever on a
+# server that stops answering, which would hang every command here.
+MZ="$(cd "$(dirname "$0")" && pwd)/maxagent-zj"
+[ -x "$MZ" ] || MZ="$(command -v maxagent-zj 2>/dev/null || true)"
+if [ -n "$NEED_ZELLIJ" ] && [ -z "$MZ" ]; then
+  echo "$APP: maxagent-zj not found next to $0. Re-run the installer (install.sh)." >&2
+  exit 127
+fi
 
 _usage(){
   cat <<EOF
@@ -145,7 +156,20 @@ _session_exists(){
 
 _session_known(){
   local session="$1"
-  _session_exists "$session" || [ -r "$(_session_meta_dir)/${session}.env" ]
+  _session_exists "$session" || _session_stuck "$session" || [ -r "$(_session_meta_dir)/${session}.env" ]
+}
+
+_session_stuck(){
+  local stuck
+  stuck="$(_stuck_names)"
+  grep -qxF "$1" <<<"$stuck"
+}
+
+_refuse_stuck(){
+  _session_stuck "$1" || return 0
+  echo "$APP: session '$1' is not responding (its zellij server stopped answering)." >&2
+  echo "End it with: $APP close $1" >&2
+  return 1
 }
 
 # Best-effort reverse of systemd-escape; falls back to the raw instance when
@@ -183,22 +207,26 @@ _legacy_unit_for(){
 }
 
 _sessions(){
-  # zellij exits 1 when there are no sessions; tolerate it under pipefail.
-  { "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } \
-    | sed $'s/\033\\[[0-9;]*m//g' \
-    | { grep -vi 'EXITED' || true; } \
-    | awk 'NF && !seen[$1]++{print $1}'
+  { "$MZ" live || true; } | awk 'NF && !seen[$0]++'
+}
+
+# Sessions whose zellij server stopped answering (set aside by maxagent-zj).
+_stuck_names(){
+  { "$MZ" stuck || true; } | cut -f1
 }
 
 _prune(){
-  local live u inst name
-  live="$({ "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } | sed $'s/\033\\[[0-9;]*m//g' | { grep -vi 'EXITED' || true; } | awk 'NF{print $1}')"
-  { "$MAXAGENT_ZELLIJ" list-sessions 2>/dev/null || true; } | sed $'s/\033\\[[0-9;]*m//g' | { grep -i 'EXITED' || true; } \
-    | awk 'NF{print $1}' | while read -r name; do "$MAXAGENT_ZELLIJ" delete-session -f "$name" >/dev/null 2>&1; done
+  local live stuck u inst name
+  live="$(_sessions)"
+  # A stuck session is not gone: it is listed and left for the user to end.
+  stuck="$(_stuck_names)"
+  { "$MZ" exited || true; } | while IFS= read -r name; do
+    [ -n "$name" ] && { "$MZ" forget "$name" >/dev/null 2>&1 || true; }
+  done
   for meta in "$(_session_meta_dir)"/*.env; do
     [ -e "$meta" ] || continue
     name="$(basename "$meta" .env)"
-    grep -qxF "$name" <<<"$live" || rm -f "$meta"
+    grep -qxF "$name" <<<"$live" || grep -qxF "$name" <<<"$stuck" || rm -f "$meta"
   done
   _has_systemd || return 0
   for u in $(systemctl --user list-units 'maxagent-named@*' 'maxclaude@*' 'maxclaude-named@*' --no-legend 2>/dev/null | awk '{print $1}'); do
@@ -210,6 +238,7 @@ _prune(){
       *) continue ;;
     esac
     grep -qxF "$name" <<<"$live" && continue
+    grep -qxF "$name" <<<"$stuck" && continue
     systemctl --user stop "$u" >/dev/null 2>&1
     systemctl --user reset-failed "$u" >/dev/null 2>&1
   done
@@ -261,8 +290,10 @@ _close(){
     systemctl --user disable --now "$(_unit_for "$sess")" >/dev/null 2>&1 || true
     systemctl --user disable --now "$(_legacy_unit_for "$sess")" >/dev/null 2>&1 || true
   fi
-  "$MAXAGENT_ZELLIJ" kill-session "$sess" >/dev/null 2>&1 || true
-  "$MAXAGENT_ZELLIJ" delete-session -f "$sess" >/dev/null 2>&1 || true
+  if ! "$MZ" stop "$sess"; then
+    echo "$APP: could not confirm that session '$sess' ended; see the message above." >&2
+    return 1
+  fi
   rm -f "$(_session_meta_dir)/${sess}.env"
   echo "Closed session: $sess."
 }
@@ -281,6 +312,7 @@ _open(){
   layout="agent${panes}"
   local meta_file prov_arg yolo_arg current_yolo
   meta_file="$(_session_meta_dir)/${session}.env"
+  _refuse_stuck "$session" || return 1
   if _session_exists "$session"; then
     # Re-attach to a live session. Only enforce the yolo check when we have
     # recorded metadata (a pre-upgrade session has none; don't false-alarm).
@@ -312,10 +344,11 @@ _open(){
 }
 
 _list(){
-  local names i=0 nm provider panes yolo tags label
+  local names i=0 nm provider panes yolo tags label stuck pid since
   _prune
   names="$(_sessions)"
-  if [ -z "$names" ]; then echo "No ${APP} sessions."; return; fi
+  stuck="$("$MZ" stuck || true)"
+  if [ -z "$names" ] && [ -z "$stuck" ]; then echo "No ${APP} sessions."; return; fi
   echo "${APP} sessions:"
   while IFS= read -r nm; do
     if [ -z "$nm" ]; then
@@ -335,6 +368,14 @@ _list(){
     fi
     printf '  %2d) %-22s [%s]\n' "$i" "$nm" "$tags"
   done <<< "$names"
+  if [ -n "$stuck" ]; then
+    echo "not responding (zellij cannot reach these; the sessions above are unaffected):"
+    while IFS=$'\t' read -r nm pid since; do
+      [ -n "$nm" ] || continue
+      printf '      %-22s [zellij server pid %s, stopped answering by %s]\n' "$nm" "${pid:-unknown}" "${since:-?}"
+    done <<< "$stuck"
+    echo "  End one with: $APP close <name>"
+  fi
   echo
   echo "Attach: $APP attach <number>    Close: $APP close <number>    GC: $APP prune"
 }
@@ -346,8 +387,12 @@ _kill_all(){
       | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1 || true; done
     for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1 || true; done
   fi
-  "$MAXAGENT_ZELLIJ" kill-all-sessions -y >/dev/null 2>&1 || true
-  "$MAXAGENT_ZELLIJ" delete-all-sessions -y -f >/dev/null 2>&1 || true
+  { _sessions; _stuck_names; } | while IFS= read -r n; do
+    [ -n "$n" ] && { "$MZ" stop "$n" >/dev/null || true; }
+  done
+  { "$MZ" exited || true; } | while IFS= read -r n; do
+    [ -n "$n" ] && { "$MZ" forget "$n" >/dev/null 2>&1 || true; }
+  done
   rm -f "$(_session_meta_dir)"/*.env 2>/dev/null || true
   echo "ALL maxagent sessions stopped."
 }
@@ -384,6 +429,7 @@ _main(){
       tgt="${2:-}"
       [ -n "$tgt" ] || { echo "usage: $APP attach <number|name>" >&2; _list; return 2; }
       tgt="$(_resolve_list_index "$tgt")" || return $?
+      _refuse_stuck "$tgt" || return 1
       if ! _session_exists "$tgt" && [ -r "$(_session_meta_dir)/${tgt}.env" ]; then
         # Known but not live: recreate then attach (create-or-attach), matching
         # the old maxclaude behavior instead of erroring on a dead session.
