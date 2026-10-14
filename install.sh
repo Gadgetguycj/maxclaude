@@ -245,6 +245,7 @@ install -m 0755 "$SRC_DIR/bin/maxcodex" "$BIN_DIR/maxcodex"
 install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
+install -m 0755 "$SRC_DIR/bin/maxagent-zj" "$BIN_DIR/maxagent-zj"
 # Drop artifacts from older maxclaude installs that this layout no longer uses
 # (maxclaude-svc is now just maxagent-svc; the per-pane launcher is maxagent-pane).
 rm -f "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
@@ -334,8 +335,13 @@ if [ -n "$USE_SYSTEMD" ]; then
   # session, so stopping live ones mid-upgrade would kill running sessions.
   # Any leftover ghost unit is cleaned by 'maxagent close' / 'maxagent prune'.
   rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
+  # Every minute, set aside a zellij server that stopped answering, so it cannot
+  # hang zellij for the other sessions.
+  install -m 0644 "$SRC_DIR/systemd/maxagent-zj-watch.service" "$SRC_DIR/systemd/maxagent-zj-watch.timer" "$UNIT_DIR/"
   systemctl --user daemon-reload 2>/dev/null || true
-  ok "services  -> $UNIT_DIR/maxagent-named@.service"
+  systemctl --user enable --now maxagent-zj-watch.timer >/dev/null 2>&1 \
+    || warn "could not enable maxagent-zj-watch.timer"
+  ok "services  -> $UNIT_DIR/maxagent-named@.service, maxagent-zj-watch.timer"
   if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
     warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"
   else

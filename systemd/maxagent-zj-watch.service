@@ -1,0 +1,7 @@
+[Unit]
+Description=Set aside zellij sessions whose server stopped answering
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/maxagent-zj watch
+TimeoutStartSec=120

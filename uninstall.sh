@@ -33,15 +33,16 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
   systemctl --user list-units 'maxagent-named@*' 'maxclaude@*' 'maxclaude-named@*' --all --no-legend 2>/dev/null | awk '{print $1}' \
     | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1 || true; done
   for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1 || true; done
+  systemctl --user disable --now maxagent-zj-watch.timer >/dev/null 2>&1 || true
 fi
 
-rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" "$BIN_DIR/maxagent-svc"
+rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-zj"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$BIN_DIR/maxclaude" "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
 fi
 rm -f "$LAYOUT_DIR"/agent{1,2,3,4}.kdl
 rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
-rm -f "$UNIT_DIR/maxagent-named@.service"
+rm -f "$UNIT_DIR/maxagent-named@.service" "$UNIT_DIR/maxagent-zj-watch.service" "$UNIT_DIR/maxagent-zj-watch.timer"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
   rm -rf "$CFG_DIR/maxclaude"

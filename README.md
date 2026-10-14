@@ -225,6 +225,26 @@ after changing a provider profile.
 Sessions do **not** survive a full reboot. They survive logging out or SSH
 disconnects when systemd linger or zellij background persistence is available.
 
+### A session that stops responding
+
+zellij's own commands (`list-sessions`, `attach`, `kill-session`) contact every
+session's server in turn and wait for each reply with no time limit. One server
+that keeps its socket but stops answering, for example one stuck while it shuts
+down, would hang every zellij command on the machine.
+
+`~/.local/bin/maxagent-zj` does maxagent's session checks instead. It asks each
+server on its own under a 3 second deadline. A server that misses the deadline
+twice has its socket moved to `zellij/stuck/` beside zellij's socket directory,
+so every other session keeps working. The stuck server keeps running and
+`maxagent ls` lists it under "not responding" with its pid. `maxagent close
+<name>` ends it with SIGKILL, because zellij ignores SIGTERM once a pane has
+started. Every stop also waits for the server to exit and kills it if it is
+still running 10 seconds after it was asked to end. On systemd hosts,
+`maxagent-zj-watch.timer` runs the same check every minute.
+
+`test/unresponsive-session.sh <bin dir>` reproduces the failure by stopping one
+server with SIGSTOP in a private zellij socket directory. It needs Linux.
+
 ## Upgrading from maxclaude
 
 If you previously installed the Claude-only `maxclaude` and have sessions still
