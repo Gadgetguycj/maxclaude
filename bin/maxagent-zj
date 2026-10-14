@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# maxagent-zj: find and end zellij sessions without letting one stuck zellij
+# server hang the caller.
+#
+# zellij's own session discovery, used by list-sessions, attach, kill-session,
+# delete-session, pipe and every action, connects to each session socket in
+# turn and waits for its reply with no time limit. A server that keeps its
+# socket but stops answering, for example one stuck while it shuts down, hangs
+# every zellij command on the machine. This helper asks each server on its own,
+# in parallel, under a deadline. A server that misses the deadline twice has
+# its socket moved to a "stuck" directory beside zellij's socket directory, so
+# zellij keeps working for every other session. The stuck server is not
+# killed. It is reported by name and pid until it is ended with `stop`.
+#
+#   maxagent-zj live           names of sessions whose server answered, oldest first
+#   maxagent-zj stuck          name, server pid and time set aside, one per line, tab separated
+#   maxagent-zj state <name>   live, stuck or none
+#   maxagent-zj exited         names of resurrectable sessions that have no server
+#   maxagent-zj stop <name>    end a session, make sure its server exits, delete its resurrection data
+#   maxagent-zj forget <name>  delete a session's resurrection data
+#   maxagent-zj watch          check every session, and recheck the stuck ones (for a timer)
+
+set -uo pipefail
+unset ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID
+
+ZJ="${MAXAGENT_ZELLIJ:-${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}}"
+if [ ! -x "$ZJ" ]; then
+  ZJ="$(command -v zellij 2>/dev/null || true)"
+fi
+[ -n "$ZJ" ] || { echo "maxagent-zj: zellij not found" >&2; exit 127; }
+
+APP="${MAXAGENT_APP:-maxagent}"
+PROBE_SECS="${MAXAGENT_ZJ_PROBE_SECONDS:-3}"
+STOP_SECS="${MAXAGENT_ZJ_STOP_SECONDS:-10}"
+PARALLEL="${MAXAGENT_ZJ_PARALLEL:-16}"
+
+# zellij's socket directory: $ZELLIJ_SOCKET_DIR, else $XDG_RUNTIME_DIR/zellij
+# (Linux), else $TMPDIR/zellij-<uid>, plus a protocol subdirectory.
+if [ -n "${ZELLIJ_SOCKET_DIR:-}" ]; then
+  ROOT="$ZELLIJ_SOCKET_DIR"
+elif [ "$(uname -s)" != Darwin ] && [ "${XDG_RUNTIME_DIR:-}" != "${XDG_RUNTIME_DIR#/}" ]; then
+  ROOT="$XDG_RUNTIME_DIR/zellij"
+else
+  ROOT="${TMPDIR:-/tmp}"
+  ROOT="${ROOT%/}/zellij-$(id -u)"
+fi
+CONTRACT=contract_version_1
+if [ ! -d "$ROOT/$CONTRACT" ]; then
+  # zellij before 0.44 named the subdirectory after its version.
+  _v="$("$ZJ" --version 2>/dev/null | awk '{print $2}')"
+  [ -n "$_v" ] && [ -d "$ROOT/$_v" ] && CONTRACT="$_v"
+fi
+SOCK_DIR="$ROOT/$CONTRACT"
+if [ -d "$SOCK_DIR" ]; then
+  # Probe links must be on the socket's own filesystem.
+  SOCK_DIR="$(cd "$SOCK_DIR" && pwd -P)"
+  ROOT="${SOCK_DIR%/*}"
+fi
+STUCK_DIR="$ROOT/stuck"
+INFO_DIR="$ROOT/stuck.info"
+
+_log(){
+  echo "$APP: $1" >&2
+  if command -v logger >/dev/null 2>&1; then
+    logger -t maxagent-zj -p user.warning -- "$1" 2>/dev/null || true
+  fi
+}
+
+# shellcheck disable=SC2012 # one known path; ls -di is the portable way to read its inode
+_ino(){ ls -di -- "$1" 2>/dev/null | awk '{print $1}'; }
+
+# Run a command with a deadline. Exit status 124 or 137 means the deadline passed.
+_limit(){
+  local secs="$1" pid i=0
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -s KILL "$secs" "$@"
+    return
+  fi
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt $((secs * 10)) ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 124
+  fi
+  wait "$pid"
+}
+
+# Run zellij with its discovery limited to one socket, or to none when the
+# socket is "". zellij sees the socket through a hard link in a private
+# directory, so no other server is contacted.
+#   _zj_scoped <secs> <socket path|""> <out file> <zellij args...>
+# Exit status: zellij's, 124 or 137 on deadline, 125 when the socket could not
+# be linked, 126 when the private directory could not be made. On 0 to 123 the
+# global LINK_GONE is 1 when zellij removed the link because nothing listens.
+LINK_GONE=0
+_zj_scoped(){
+  local secs="$1" sock="$2" out="$3" view rc name=""
+  shift 3
+  LINK_GONE=0
+  view="$(mktemp -d "$ROOT/.mz.XXXXXX" 2>/dev/null)" || return 126
+  mkdir "$view/$CONTRACT" || { rm -rf "$view"; return 126; }
+  if [ -n "$sock" ]; then
+    name="${sock##*/}"
+    if ! ln -- "$sock" "$view/$CONTRACT/$name" 2>/dev/null; then
+      rm -rf "$view"
+      return 125
+    fi
+  fi
+  _limit "$secs" env ZELLIJ_SOCKET_DIR="$view" "$ZJ" "$@" >"$out" 2>&1 </dev/null
+  rc=$?
+  if [ -n "$name" ] && [ ! -e "$view/$CONTRACT/$name" ]; then
+    LINK_GONE=1
+  fi
+  rm -rf "$view"
+  return "$rc"
+}
+
+# Ask one server whether it is alive. Prints live, noreply, gone or unknown.
+# unknown means the probe itself could not run; callers treat it as present.
+_probe(){
+  local sock="$1" rc
+  [ -S "$sock" ] || { echo gone; return; }
+  _zj_scoped "$PROBE_SECS" "$sock" /dev/null list-sessions -n
+  rc=$?
+  case "$rc" in
+    124|137) echo noreply ;;
+    125|126) if [ -S "$sock" ]; then echo unknown; else echo gone; fi ;;
+    *) if [ "$LINK_GONE" = 1 ]; then echo gone; else echo live; fi ;;
+  esac
+}
+
+# Pid of the zellij server listening on a socket file, or nothing.
+_server_pid(){
+  local sock="$1" name ino pid=""
+  name="${sock##*/}"
+  ino="$(_ino "$sock")"
+  if [ -n "$ino" ] && command -v ss >/dev/null 2>&1; then
+    pid="$(ss -xlpHe 2>/dev/null | awk -v want="ino:$ino" -v root="$ROOT/" '
+      index($0, root) {
+        for (i = 1; i <= NF; i++)
+          if ($i == want && match($0, /pid=[0-9]+/)) { print substr($0, RSTART + 4, RLENGTH - 4); exit }
+      }')"
+  fi
+  if [ -z "$pid" ]; then
+    # zellij starts its server as "zellij --server <socket path>".
+    pid="$(ps -eo pid=,args= 2>/dev/null | awk -v tail=" --server $SOCK_DIR/$name" '
+      length($0) >= length(tail) && substr($0, length($0) - length(tail) + 1) == tail { print $1; exit }')"
+  fi
+  printf '%s\n' "$pid"
+}
+
+# A zellij process that has not exited. A zombie has exited: its sockets are closed.
+_alive(){
+  local st
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  st="$(ps -o stat= -p "$1" 2>/dev/null)"
+  case "$st" in ''|Z*) return 1 ;; esac
+  case "$(ps -o comm= -p "$1" 2>/dev/null)" in *zellij*) return 0 ;; *) return 1 ;; esac
+}
+
+_info(){ awk -F= -v k="$2" '$1 == k {print substr($0, length(k) + 2); exit}' "$INFO_DIR/$1" 2>/dev/null; }
+
+_set_aside(){
+  local name="$1" pid
+  [ -S "$SOCK_DIR/$name" ] || return 1
+  pid="$(_server_pid "$SOCK_DIR/$name")"
+  mkdir -p "$STUCK_DIR" "$INFO_DIR" && chmod 700 "$STUCK_DIR" "$INFO_DIR" || return 1
+  # A rename keeps the socket's inode, so the server stays reachable there.
+  mv -f -- "$SOCK_DIR/$name" "$STUCK_DIR/$name" || return 1
+  printf 'pid=%s\nsince=%s\n' "$pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$INFO_DIR/$name"
+  _log "session '$name' is not responding: its zellij server (pid ${pid:-unknown}) did not answer within ${PROBE_SECS}s, twice. Its socket was moved to $STUCK_DIR so zellij keeps working for the other sessions. End it with: $APP close $name"
+}
+
+# Probe every socket in parallel. Prints "name<TAB>state", oldest first, the
+# order zellij lists sessions in. Sets aside servers that miss twice.
+_scan(){
+  local tmp n=0 i name state
+  [ -d "$SOCK_DIR" ] || return 0
+  tmp="$(mktemp -d 2>/dev/null)" || { echo "$APP: cannot create a temporary directory" >&2; return 1; }
+  while IFS= read -r name; do
+    [ -S "$SOCK_DIR/$name" ] || continue
+    n=$((n + 1))
+    printf '%s\n' "$name" >"$tmp/$n.name"
+    _probe "$SOCK_DIR/$name" >"$tmp/$n.state" &
+    if [ $((n % PARALLEL)) -eq 0 ]; then wait; fi
+  done < <(cd "$SOCK_DIR" 2>/dev/null && ls -1trA)
+  wait
+  # One miss can be a busy moment, so ask again before calling a server stuck.
+  for ((i = 1; i <= n; i++)); do
+    if [ "$(cat "$tmp/$i.state")" = noreply ]; then
+      _probe "$SOCK_DIR/$(cat "$tmp/$i.name")" >"$tmp/$i.state" &
+    fi
+  done
+  wait
+  for ((i = 1; i <= n; i++)); do
+    name="$(cat "$tmp/$i.name")"
+    state="$(cat "$tmp/$i.state")"
+    case "$state" in
+      noreply)
+        if _set_aside "$name" || [ -S "$STUCK_DIR/$name" ]; then state=stuck
+        elif [ -S "$SOCK_DIR/$name" ]; then state=unknown
+        else state=gone
+        fi ;;
+      unknown) echo "$APP: could not check zellij session '$name'; listing it as running" >&2 ;;
+    esac
+    printf '%s\t%s\n' "$name" "$state"
+  done
+  rm -rf "$tmp"
+}
+
+_live(){
+  _scan | awk -F'\t' '$2 == "live" || $2 == "unknown" { print $1 }'
+}
+
+# Stuck sessions whose server still runs. Leftovers of servers that have since
+# exited are removed.
+_stuck(){
+  local sock name pid
+  [ -d "$STUCK_DIR" ] || return 0
+  for sock in "$STUCK_DIR"/* "$STUCK_DIR"/.[!.]*; do
+    [ -S "$sock" ] || continue
+    name="${sock##*/}"
+    pid="$(_info "$name" pid)"
+    [ -n "$pid" ] || pid="$(_server_pid "$sock")"
+    if ! _alive "$pid"; then
+      rm -f -- "$sock" "$INFO_DIR/$name"
+      _log "stuck session '$name': its zellij server ${pid:+(pid $pid) }is gone; removed its socket"
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$name" "$pid" "$(_info "$name" since)"
+  done
+}
+
+_state(){
+  local name="$1" live stuck
+  live="$(_live)"
+  stuck="$(_stuck | cut -f1)"
+  if grep -qxF -- "$name" <<<"$live"; then echo live
+  elif grep -qxF -- "$name" <<<"$stuck"; then echo stuck
+  else echo none
+  fi
+}
+
+_forget(){
+  local name="$1" out rc
+  out="$(mktemp)" || return 1
+  _zj_scoped "$PROBE_SECS" "" "$out" delete-session "$name"
+  rc=$?
+  case "$rc" in
+    0|2) rc=0 ;;   # 2: zellij had no resurrection data for it
+    *) _log "could not delete resurrection data for session '$name' (zellij exit $rc): $(tr '\n' ' ' <"$out")" ;;
+  esac
+  rm -f "$out"
+  return "$rc"
+}
+
+_exited(){
+  local out names sock_names=""
+  out="$(mktemp)" || return 1
+  _zj_scoped "$PROBE_SECS" "" "$out" list-sessions -n
+  names="$(sed $'s/\033\\[[0-9;]*m//g' "$out" | awk '/EXITED/ && NF {print $1}')"
+  rm -f "$out"
+  [ -n "$names" ] || return 0
+  # Without sockets zellij calls every saved session EXITED; keep only those
+  # with no server.
+  sock_names="$( { cd "$SOCK_DIR" 2>/dev/null && ls -1A; cd "$STUCK_DIR" 2>/dev/null && ls -1A; } 2>/dev/null)"
+  grep -vxF -f <(printf '%s\n' "$sock_names") <<<"$names" || true
+}
+
+# End a session: ask its server to quit, wait for it to exit, kill it if it
+# does not, then delete its resurrection data. zellij ignores SIGTERM once a
+# pane has started, so SIGKILL is the only signal that ends a stuck server.
+_stop(){
+  local name="$1" sock pid ino end asked out rc=0
+  for sock in "$SOCK_DIR/$name" "$STUCK_DIR/$name"; do
+    [ -S "$sock" ] || continue
+    ino="$(_ino "$sock")"
+    pid="$(_server_pid "$sock")"
+    if [ -z "$pid" ] && [ "$sock" = "$STUCK_DIR/$name" ]; then
+      pid="$(_info "$name" pid)"
+    fi
+    asked=""
+    if [ "$sock" = "$SOCK_DIR/$name" ]; then
+      out="$(mktemp)"
+      # kill-session only sends the request and returns.
+      if _zj_scoped "$PROBE_SECS" "$sock" "$out" kill-session "$name"; then asked=1; fi
+      rm -f "$out"
+    fi
+    if _alive "$pid"; then
+      if [ -n "$asked" ]; then
+        end=$((SECONDS + STOP_SECS))
+        while _alive "$pid" && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
+      fi
+      if _alive "$pid"; then
+        kill -KILL "$pid" 2>/dev/null
+        if [ -n "$asked" ]; then
+          _log "session '$name': its zellij server (pid $pid) was still running ${STOP_SECS}s after it was asked to end; sent SIGKILL"
+        else
+          _log "session '$name': its zellij server (pid $pid) did not answer; sent SIGKILL"
+        fi
+        end=$((SECONDS + 5))
+        while _alive "$pid" && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
+        if _alive "$pid"; then
+          _log "session '$name': zellij server pid $pid is still running after SIGKILL"
+          rc=1
+          continue
+        fi
+      fi
+    elif [ -z "$pid" ]; then
+      # No pid to watch: a server that exits removes its own socket file.
+      if [ -n "$asked" ]; then
+        end=$((SECONDS + STOP_SECS))
+        while [ -S "$sock" ] && [ "$SECONDS" -lt "$end" ]; do sleep 0.2; done
+      fi
+      if [ -S "$sock" ] && [ "$(_probe "$sock")" != gone ]; then
+        _log "session '$name': cannot confirm its zellij server exited and cannot find its pid; left its socket at $sock"
+        rc=1
+        continue
+      fi
+    fi
+    # A killed server leaves its socket file behind.
+    if [ -S "$sock" ] && [ "$(_ino "$sock")" = "$ino" ]; then rm -f -- "$sock"; fi
+    [ "$sock" = "$STUCK_DIR/$name" ] && rm -f -- "$INFO_DIR/$name"
+  done
+  _forget "$name" || rc=1
+  return "$rc"
+}
+
+# For a timer: set aside new stuck servers, return recovered ones, and clear
+# the leftovers of stuck servers that have exited.
+_watch(){
+  local name
+  _scan >/dev/null
+  while IFS=$'\t' read -r name _; do
+    [ -n "$name" ] || continue
+    [ -e "$SOCK_DIR/$name" ] && continue
+    if [ "$(_probe "$STUCK_DIR/$name")" = live ] && [ "$(_probe "$STUCK_DIR/$name")" = live ]; then
+      mv -- "$STUCK_DIR/$name" "$SOCK_DIR/$name" && rm -f -- "$INFO_DIR/$name"
+      _log "session '$name' answers again; moved its socket back"
+    fi
+  done < <(_stuck)
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  live) _live ;;
+  stuck) _stuck ;;
+  state) [ -n "${2:-}" ] || { echo "usage: maxagent-zj state <name>" >&2; exit 2; }; _state "$2" ;;
+  exited) _exited ;;
+  stop) [ -n "${2:-}" ] || { echo "usage: maxagent-zj stop <name>" >&2; exit 2; }; _stop "$2" ;;
+  forget) [ -n "${2:-}" ] || { echo "usage: maxagent-zj forget <name>" >&2; exit 2; }; _forget "$2" ;;
+  watch) _watch ;;
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac
