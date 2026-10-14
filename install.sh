@@ -290,6 +290,7 @@ install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
 install -m 0755 "$SRC_DIR/bin/maxagent-usage" "$BIN_DIR/maxagent-usage"
+install -m 0755 "$SRC_DIR/bin/maxagent-zj" "$BIN_DIR/maxagent-zj"
 # maxclaude-svc, maxclaude-pane and the cc* layouts are NOT removed here: they
 # are the router-mode pane path, installed in the router section below.
 ok "commands  -> $BIN_DIR/maxagent, maxcodex, maxclaude"
@@ -465,6 +466,9 @@ if [ -n "$USE_SYSTEMD" ]; then
   if [ ! -f "$AGENT_CFG_DIR/browser-reaper.env" ]; then
     ( umask 077; printf 'MAXCLAUDE_BROWSER_MAX_HOURS=0\n' > "$AGENT_CFG_DIR/browser-reaper.env" )
   fi
+  # Every minute, set aside a zellij server that stopped answering, so it cannot
+  # hang zellij for the other sessions.
+  install -m 0644 "$SRC_DIR/systemd/maxagent-zj-watch.service" "$SRC_DIR/systemd/maxagent-zj-watch.timer" "$UNIT_DIR/"
   # maxclaude-named@ drives the router-mode sessions; keep a live box's copy.
   if [ ! -f "$UNIT_DIR/maxclaude-named@.service" ]; then
     install -m 0644 "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
@@ -476,7 +480,9 @@ if [ -n "$USE_SYSTEMD" ]; then
   systemctl --user enable --now maxrouter-blockd.service 2>/dev/null || true
   systemctl --user enable --now maxrouter-heartbeat.service 2>/dev/null || true
   systemctl --user enable --now maxclaude-browser-reaper.timer 2>/dev/null || true
-  ok "services  -> maxagent, maxclaude, and maxrouter user units in $UNIT_DIR"
+  systemctl --user enable --now maxagent-zj-watch.timer >/dev/null 2>&1 \
+    || warn "could not enable maxagent-zj-watch.timer"
+  ok "services  -> maxagent, maxclaude, and maxrouter user units and maxagent-zj-watch.timer in $UNIT_DIR"
   if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
     warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"
   else

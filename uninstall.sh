@@ -38,6 +38,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
   done
   systemctl --user disable --now maxclaude-browser-reaper.timer >/dev/null 2>&1 || true
   systemctl --user stop maxclaude-browser-reaper.service >/dev/null 2>&1 || true
+  systemctl --user disable --now maxagent-zj-watch.timer >/dev/null 2>&1 || true
 fi
 
 # Router mode (maxrouter): remove what install.sh's router section added.
@@ -56,13 +57,13 @@ rm -rf "$MAXCLAUDE_CFG_DIR/router/outbox" "$MAXCLAUDE_CFG_DIR/sessions"
 rmdir "$MAXCLAUDE_CFG_DIR/router" 2>/dev/null || true
 
 rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" \
-      "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-usage"
+      "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-usage" "$BIN_DIR/maxagent-zj"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$BIN_DIR/maxclaude" "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
 fi
 rm -f "$LAYOUT_DIR"/agent{1,2,3,4}.kdl
 rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
-rm -f "$UNIT_DIR/maxagent-named@.service"
+rm -f "$UNIT_DIR/maxagent-named@.service" "$UNIT_DIR/maxagent-zj-watch.service" "$UNIT_DIR/maxagent-zj-watch.timer"
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
   # Only the throwaway per-session state; router user data survives (see above).
