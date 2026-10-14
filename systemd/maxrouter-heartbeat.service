@@ -1,0 +1,16 @@
+[Unit]
+Description=maxrouter heartbeat watcher: push still-working heartbeats/alerts + orphan capture for long headless turns
+After=default.target
+
+[Service]
+# Samples in-flight headless turn markers; pushes ~10-min heartbeats with
+# transcript/token evidence, a loud alert past ~30 min, and captures orphans.
+Type=simple
+Environment=IS_SANDBOX=1
+ExecStart=%h/.local/bin/mxr-heartbeatd
+Restart=always
+RestartSec=2
+
+[Install]
+# Safe to run always (no-ops when nothing is in flight / no live router).
+WantedBy=default.target

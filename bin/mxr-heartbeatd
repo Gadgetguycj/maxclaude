@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# mxr-heartbeatd: keeps the operator in touch during LONG headless turns, so a
+# turn that runs for hours can never go silent again.
+#
+# mxr writes an .inflight/<task> marker when it dispatches a headless turn. This
+# daemon samples those markers on a short interval and, per task:
+#   - every ~10 min while the turn is still running: pushes a [worker-heartbeat]
+#     with transcript-growth + token evidence into the router pane,
+#   - once the turn passes ~30 min: pushes a loud [worker-alert],
+#   - if the turn's process is gone with a stale transcript and NO reply in the
+#     outbox: pushes a loud [worker-orphan] AND writes a synthetic outbox entry
+#     so the failure is captured, health stops showing WORKING, and it is never
+#     silently lost.
+# The router never polls for any of this: the watcher pushes.
+set -uo pipefail
+
+MXR_HOME="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+OUTBOX="$MXR_HOME/router/outbox"
+INFLIGHT="$OUTBOX/.inflight"
+REG="$MXR_HOME/registry.json"
+DEFAULT_WORKDIR="${MAXROUTER_DEFAULT_WORKDIR:-$HOME}"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+NOTIFY="$BIN_DIR/mxr-notify"
+INTERVAL="${MXR_HEARTBEAT_INTERVAL:-60}"    # scan cadence (s)
+BEAT_EVERY="${MXR_HEARTBEAT_EVERY:-600}"    # heartbeat cadence per task (s) ~10m
+ALERT_AFTER="${MXR_HEARTBEAT_ALERT:-1800}"  # loud alert once a turn exceeds this ~30m
+ORPHAN_GRACE="${MXR_ORPHAN_GRACE:-90}"      # transcript-stale grace before orphan (s)
+
+mkdir -p "$INFLIGHT"
+[ -x "$NOTIFY" ] || { echo "mxr-heartbeatd: $NOTIFY not executable" >&2; exit 127; }
+
+# singleton: two heartbeat daemons would double-push
+LOCK="$MXR_HOME/router/.heartbeatd.lock"
+exec 7>"$LOCK" || { echo "mxr-heartbeatd: cannot open lock $LOCK" >&2; exit 1; }
+if ! flock -n 7; then echo "mxr-heartbeatd: another instance holds $LOCK; exiting" >&2; exit 0; fi
+
+now_epoch(){ date -u +%s; }
+human(){ local s="${1:-0}"; [ "$s" -lt 0 ] 2>/dev/null && { echo -; return; }
+  if [ "$s" -lt 60 ]; then echo "${s}s"; elif [ "$s" -lt 3600 ]; then echo "$((s/60))m"; else echo "$((s/3600))h$(((s%3600)/60))m"; fi; }
+tpath(){ printf '%s/.claude/projects/%s/%s.jsonl' "$HOME" "$(printf '%s' "$1" | sed 's|[^A-Za-z0-9]|-|g')" "$2"; }
+proc_for(){ ps -eo comm=,args= 2>/dev/null | awk -v s="$1" '$1=="claude" && index($0,s){c++} END{print c+0}'; }
+out_tokens(){ [ -f "$1" ] && jq -s '[.[]|.message.usage.output_tokens//0]|add // 0' "$1" 2>/dev/null || echo 0; }
+
+echo "mxr-heartbeatd: watching $INFLIGHT (heartbeat ${BEAT_EVERY}s, alert ${ALERT_AFTER}s; push, no router polling)" >&2
+
+while :; do
+  for m in "$INFLIGHT"/*; do
+    [ -e "$m" ] || continue
+    case "$m" in *.beat) continue ;; esac
+    task="$(jq -r '.task // ""' "$m" 2>/dev/null)"; [ -n "$task" ] || continue
+    start="$(jq -r '.start // 0' "$m" 2>/dev/null)"; lines0="$(jq -r '.lines0 // 0' "$m" 2>/dev/null)"
+    wd="$(jq -r --arg default "$DEFAULT_WORKDIR" '.workdir // $default' "$m" 2>/dev/null)"
+    # current sid from the registry (follows a sid-fork), fall back to marker's
+    sid="$(jq -r --arg t "$task" '.tasks[$t].sid // ""' "$REG" 2>/dev/null)"
+    [ -n "$sid" ] || sid="$(jq -r '.sid // ""' "$m" 2>/dev/null)"
+    now="$(now_epoch)"; elapsed=$(( now - start ))
+    tp="$(tpath "$wd" "$sid")"
+    age=-1; [ -f "$tp" ] && age=$(( now - $(stat -c %Y "$tp" 2>/dev/null || echo "$now") ))
+    running=0
+    { [ "$(proc_for "$sid")" -gt 0 ] 2>/dev/null || { [ "$age" -ge 0 ] && [ "$age" -le "$ORPHAN_GRACE" ]; }; } && running=1
+
+    beatf="$m.beat"; lastbeat=0; alerted=0
+    [ -f "$beatf" ] && { lastbeat="$(awk '{print $1}' "$beatf" 2>/dev/null||echo 0)"; alerted="$(awk '{print $2}' "$beatf" 2>/dev/null||echo 0)"; }
+
+    if [ "$running" = 1 ]; then
+      lines_now=0; [ -f "$tp" ] && lines_now="$(wc -l <"$tp" 2>/dev/null||echo 0)"
+      dl=$(( lines_now - lines0 )); [ "$dl" -lt 0 ] && dl=0
+      tok="$(out_tokens "$tp")"
+      if [ "$elapsed" -ge "$ALERT_AFTER" ] && [ "$alerted" != 1 ]; then
+        "$NOTIFY" raw "$task" "[worker-alert] '$task' headless turn has run $(human "$elapsed") (past the $(human "$ALERT_AFTER") alert threshold): still progressing (+${dl} transcript lines, ~${tok} output tokens) but unusually long. Verify it is not wedged: mxr watch $task. SSH-preservation rules still apply." || true
+        printf '%s 1\n' "$now" > "$beatf"
+      elif [ $(( now - lastbeat )) -ge "$BEAT_EVERY" ]; then
+        "$NOTIFY" raw "$task" "[worker-heartbeat] '$task' still working: $(human "$elapsed") elapsed, +${dl} transcript lines / ~${tok} output tokens since dispatch. Not stalled. (mxr watch $task)" || true
+        printf '%s %s\n' "$now" "$alerted" > "$beatf"
+      fi
+    else
+      # process gone and transcript stale: completed, or orphaned?
+      obf=0
+      if [ -f "$OUTBOX/$sid.json" ]; then
+        [ "$(stat -c %Y "$OUTBOX/$sid.json" 2>/dev/null||echo 0)" -ge "$start" ] && obf=1
+      fi
+      if [ "$obf" = 1 ]; then
+        rm -f "$m" "$beatf" 2>/dev/null || true         # completed; clear tracking
+      elif [ "$elapsed" -gt "$ORPHAN_GRACE" ]; then
+        # true orphan: capture it so it is never silent, then alert loudly
+        jq -n --arg ts "$(date -u +%FT%TZ)" --arg sid "$sid" \
+          --arg text "[ORPHANED TURN] '$task' turn ended with no reply captured after $(human "$elapsed") (process gone, transcript idle $(human "$age")). Auto-surfaced by mxr-heartbeatd; re-send if needed." \
+          '{ts:$ts,sid:$sid,text:$text}' > "$OUTBOX/$sid.json" 2>/dev/null || true
+        "$NOTIFY" raw "$task" "[worker-orphan] '$task' turn ENDED with NO reply captured after $(human "$elapsed"): this is the failure that stranded you before, surfaced now. A placeholder reply was written to the outbox. Inspect: mxr watch $task ; re-send if needed." || true
+        rm -f "$m" "$beatf" 2>/dev/null || true
+      fi
+    fi
+  done
+  sleep "$INTERVAL"
+done

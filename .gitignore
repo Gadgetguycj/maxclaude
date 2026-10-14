@@ -1,3 +1,4 @@
 # Nothing generated lands in the repo: rendered profiles and session metadata
 # live under ~/.config/maxagent. Keep this file so the layout is obvious.
 *.swp
+__pycache__/

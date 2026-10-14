@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>maxclaude</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<div id="boot" class="boot">Loading</div>
+
+<section id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <h1 class="login-title">maxclaude</h1>
+    <label class="field">
+      <span class="field-label">Password</span>
+      <input id="login-password" class="inp" type="password" name="password"
+             autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+    </label>
+    <button id="login-submit" class="btn primary block" type="submit">Log in</button>
+    <p id="login-error" class="form-error" role="alert" hidden></p>
+  </form>
+</section>
+
+<div id="app" class="app" hidden>
+  <div id="banner" class="banner" role="status" hidden></div>
+
+  <div class="body">
+    <div id="scrim" class="scrim" hidden></div>
+
+    <aside id="sidebar" class="sidebar" aria-label="Session tree">
+      <div class="side-hdr">
+        <span class="side-brand">MAXCLAUDE <span id="agent-dot" class="dot" title="Agent state unknown"></span></span>
+        <div class="side-actions">
+          <button id="new-session-root" class="side-icon" type="button" aria-label="New session" title="New session">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v9h-11z"></path><path d="M5 7l2 1.5L5 10M8.5 10.5H11"></path></svg>
+          </button>
+          <button id="new-folder-root" class="side-icon" type="button" aria-label="New folder" title="New folder">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 4.5v8h13v-7H7.5L6 4z"></path><path d="M8 7.5v4M6 9.5h4"></path></svg>
+          </button>
+          <button id="hibernate-idle" class="side-icon" type="button" aria-label="Hibernate idle sessions" title="Hibernate idle sessions">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h10v11H3z"></path><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3"></path></svg>
+          </button>
+          <button id="collapse-folders" class="side-icon" type="button" aria-label="Collapse all folders" title="Collapse all folders">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5h9v9h-9zM5.5 8h5"></path></svg>
+          </button>
+          <button id="hide-sidebar" class="side-icon" type="button" aria-label="Hide sidebar" title="Hide sidebar">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v9h-11zM6 3.5v9"></path></svg>
+          </button>
+        </div>
+      </div>
+      <div id="tree" class="tree" role="tree" aria-label="Folders and sessions"></div>
+    </aside>
+
+    <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" aria-valuemin="220" aria-valuemax="520" tabindex="0"></div>
+
+    <div id="sidebar-rail" class="sidebar-rail">
+      <button id="show-sidebar" class="side-icon" type="button" aria-label="Show sidebar" title="Show sidebar" aria-controls="sidebar" aria-expanded="false">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v9h-11zM6 3.5v9M8.5 6l2 2-2 2"></path></svg>
+      </button>
+    </div>
+
+    <main class="term" aria-label="Terminals">
+      <div class="term-actions">
+        <button id="upload-button" class="term-action upload-action" type="button" aria-label="Upload files" title="Upload files">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V2M5 5l3-3 3 3M3 9v4h10V9"></path></svg>
+        </button>
+        <button id="files-button" class="term-action" type="button" aria-label="Session files" title="Session files">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 4.5v8h13v-7H7.5L6 4z"></path></svg>
+        </button>
+      </div>
+      <div id="frames" class="frames">
+        <p id="no-session" class="empty">No session open.</p>
+      </div>
+      <div id="upload-overlay" class="upload-overlay" hidden>
+        <div class="drop-card">
+          <strong id="upload-title">Uploading</strong>
+          <span id="upload-detail"></span>
+          <progress id="upload-progress" max="1" value="0" hidden></progress>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <footer class="legend" aria-label="Session status legend">
+    <span><span class="dot st-busy"></span>Working</span>
+    <span><span class="dot st-background"></span>Background</span>
+    <span><span class="dot st-idle"></span>Idle</span>
+    <span><span class="dot st-sleeping"></span>Sleeping</span>
+    <span><span class="dot st-missing"></span>No Claude process</span>
+    <span class="grow"></span>
+    <button id="logout" class="legend-logout" type="button">Log out</button>
+  </footer>
+
+</div>
+
+<div id="modal-root"></div>
+<aside id="files-drawer" class="files-drawer" aria-label="Session files" hidden>
+  <div class="files-head">
+    <div><strong>Files</strong><span id="files-session"></span></div>
+    <button id="files-close" class="side-icon" type="button" aria-label="Close files drawer" title="Close files drawer">×</button>
+  </div>
+  <div id="files-drop" class="files-drop">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V2M5 5l3-3 3 3M3 9v4h10V9"></path></svg>
+    <div class="files-drop-text">
+      <strong>Drop files here</strong>
+      <span>Or anywhere on the page. They upload to <span id="files-drop-session">this session</span>'s inbox and their paths are typed at the prompt.</span>
+    </div>
+    <button id="files-choose" class="btn" type="button">Choose files</button>
+  </div>
+  <div id="files-list" class="files-list"></div>
+</aside>
+<div id="drop-overlay" class="drop-overlay" data-state="ready" hidden>
+  <div class="drop-card">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V2M5 5l3-3 3 3M3 9v4h10V9"></path></svg>
+    <strong id="drop-title">Drop to upload</strong>
+    <span id="drop-detail"></span>
+  </div>
+</div>
+<input id="upload-files" type="file" multiple hidden>
+<input id="upload-folder" type="file" webkitdirectory directory multiple hidden>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

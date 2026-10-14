@@ -1,0 +1,18 @@
+[Unit]
+Description=maxrouter event bridge: push worker outbox replies to the router (no polling)
+Documentation=man:inotifywait(1)
+After=default.target
+
+[Service]
+# Long-running inotify watcher on the router outbox. Lightweight: it blocks in
+# the kernel until a reply file appears, then pokes the router pane.
+Type=simple
+Environment=IS_SANDBOX=1
+ExecStart=%h/.local/bin/mxr-notifyd
+Restart=always
+RestartSec=2
+
+[Install]
+# Safe to run always (it no-ops when no router session is live), so unlike the
+# claude session units this one IS boot-persistent: the bridge is always up.
+WantedBy=default.target

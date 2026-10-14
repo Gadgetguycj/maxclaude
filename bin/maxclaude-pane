@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# maxclaude-pane: launched by the cc* zellij layouts inside each pane.
+# With no per-session env file, the pane starts in MAXCLAUDE_WORKDIR or HOME.
+# A sessions/<zellij-session>.env file can scope the pane to an org or task.
+set -euo pipefail
+
+cfg="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+sess="${ZELLIJ_SESSION_NAME:-}"
+envfile="$cfg/sessions/${sess}.env"
+
+workdir="${MAXCLAUDE_WORKDIR:-$HOME}"
+org=""
+resume_sid=""
+settings=""
+append_prompt=""
+extra_args=""
+
+if [ -n "$sess" ] && [ -f "$envfile" ]; then
+  # KEY=VALUE lines; value is everything after the first '=' (may contain spaces)
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      MAXCLAUDE_WORKDIR=*)       workdir="${line#*=}" ;;
+      MAXCLAUDE_ORG=*)           org="${line#*=}" ;;
+      MAXCLAUDE_RESUME_SID=*)    resume_sid="${line#*=}" ;;
+      MAXCLAUDE_SETTINGS=*)      settings="${line#*=}" ;;
+      MAXCLAUDE_APPEND_PROMPT=*) append_prompt="${line#*=}" ;;
+      MAXCLAUDE_EXTRA_ARGS=*)    extra_args="${line#*=}" ;;
+    esac
+  done < "$envfile"
+fi
+
+# mxr and friends live here; the zellij server env may not include it
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+esac
+
+if [ "$workdir" = '~' ]; then
+  workdir="$HOME"
+elif [ "${workdir:0:1}" = '~' ] && [ "${workdir:1:1}" = / ]; then
+  workdir="$HOME/${workdir:2}"
+fi
+[ -d "$workdir" ] || workdir="$HOME"
+cd "$workdir"
+
+if [ -n "$org" ]; then
+  export MAXCLAUDE_ORG="$org"
+fi
+
+args=(--dangerously-skip-permissions)
+if [ -n "$sess" ]; then
+  args+=("--remote-control=$sess")
+fi
+if [ -n "$resume_sid" ]; then
+  args+=(--resume "$resume_sid")
+fi
+if [ -n "$settings" ]; then
+  args+=(--settings "$settings")
+fi
+if [ -n "$append_prompt" ]; then
+  args+=(--append-system-prompt "$append_prompt")
+fi
+if [ -n "$extra_args" ]; then
+  # whitespace-split: individual extra args cannot themselves contain spaces
+  read -r -a extra <<<"$extra_args"
+  args+=("${extra[@]}")
+fi
+
+# Inherited nested-claude env leaves the session transcript empty (spike-proven)
+unset CLAUDECODE CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID \
+      CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH CLAUDE_EFFORT
+
+IS_SANDBOX=1 exec claude "${args[@]}"

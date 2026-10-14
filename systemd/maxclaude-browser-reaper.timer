@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the temporary headless browser reaper
+
+[Timer]
+OnBootSec=15m
+OnUnitActiveSec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

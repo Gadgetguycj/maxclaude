@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Run the optional private usage-status command configured outside this repo.
+set -euo pipefail
+
+cfg="${MAXAGENT_USAGE_COMMAND_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/maxagent/usage-command}"
+[ -r "$cfg" ] || exit 0
+IFS= read -r command < "$cfg"
+[ -n "$command" ] || exit 0
+exec bash -lc "$command"

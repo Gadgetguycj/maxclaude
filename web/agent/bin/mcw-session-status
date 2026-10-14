@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Claude Code hooks call this with busy or idle. Hooks must never block a turn.
+set -u
+
+state="${1:-}"
+event="${2:-}"
+case "$state" in busy|idle) ;; *) exit 0 ;; esac
+session="${ZELLIJ_SESSION_NAME:-}"
+pane="${ZELLIJ_PANE_ID:-}"
+case "$session" in ''|*[!A-Za-z0-9._-]*) exit 0 ;; esac
+case "$pane" in ''|*[!0-9]*) exit 0 ;; esac
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+base="${MCW_STATE_DIR:-$config_home/maxclaude-web}/session-status/$session"
+( umask 077; mkdir -p "$base" ) 2>/dev/null || exit 0
+tmp="$base/.${pane}.$$.tmp"
+milliseconds="$(date +%s%3N 2>/dev/null || echo 0)"
+pid="${PPID:-0}"
+case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+payload="$(cat 2>/dev/null || true)"
+transcript=""
+if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then
+  transcript="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+fi
+case "$transcript" in "$claude_dir"/projects/*.jsonl) ;; *) transcript="" ;; esac
+
+if command -v jq >/dev/null 2>&1; then
+  jq -cn --arg state "$state" --argjson updatedAt "$milliseconds" --argjson pid "$pid" \
+    --arg transcriptPath "$transcript" \
+    '{state:$state,updatedAt:$updatedAt,pid:$pid} + (if $transcriptPath == "" then {} else {transcriptPath:$transcriptPath} end)' \
+    > "$tmp" 2>/dev/null || true
+else
+  printf '{"state":"%s","updatedAt":%s,"pid":%s}\n' "$state" "$milliseconds" "$pid" > "$tmp" 2>/dev/null || true
+fi
+if [ -s "$tmp" ]; then mv -f "$tmp" "$base/$pane.json" 2>/dev/null || true; else rm -f "$tmp" 2>/dev/null || true; fi
+
+if [ "$event" = "stop" ]; then
+  response_tmp="$base/.${pane}.response.$$.tmp"
+  if command -v jq >/dev/null 2>&1; then
+    jq -cn --argjson lastResponseAt "$milliseconds" --arg transcriptPath "$transcript" \
+      '{lastResponseAt:$lastResponseAt} + (if $transcriptPath == "" then {} else {transcriptPath:$transcriptPath} end)' \
+      > "$response_tmp" 2>/dev/null || true
+  else
+    printf '{"lastResponseAt":%s}\n' "$milliseconds" > "$response_tmp" 2>/dev/null || true
+  fi
+  if [ -s "$response_tmp" ]; then mv -f "$response_tmp" "$base/$pane.response.json" 2>/dev/null || true; else rm -f "$response_tmp" 2>/dev/null || true; fi
+
+  background_tmp="$base/.${pane}.background.$$.tmp"
+  if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then
+    printf '%s' "$payload" | jq -c --argjson updatedAt "$milliseconds" --arg transcriptPath "$transcript" '
+      {updatedAt:$updatedAt,taskCount:([.background_tasks[]?] | length)}
+      + (if $transcriptPath == "" then {} else {transcriptPath:$transcriptPath} end)
+    ' > "$background_tmp" 2>/dev/null || true
+  else
+    printf '{"updatedAt":%s,"taskCount":0}\n' "$milliseconds" > "$background_tmp" 2>/dev/null || true
+  fi
+  if [ -s "$background_tmp" ]; then mv -f "$background_tmp" "$base/$pane.background.json" 2>/dev/null || true; else rm -f "$background_tmp" 2>/dev/null || true; fi
+fi
+exit 0
