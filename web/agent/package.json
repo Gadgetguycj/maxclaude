@@ -14,7 +14,8 @@
     "test:wsgate": "node test/wsgate.mjs",
     "test:service-template": "node test/service-template.mjs",
     "test:browser-reaper": "bash ../../test/browser-reaper.sh",
-    "test:integration": "node test/integration.mjs"
+    "test:integration": "node test/integration.mjs",
+    "test:zellij-unresponsive": "node test/zellij-unresponsive.mjs"
   },
   "dependencies": {
     "ws": "^8.18.3"

@@ -17,6 +17,7 @@ export const config = {
   projectsDir: env.MCW_PROJECTS_DIR || path.join(claudeDir, 'projects'),
   sessionEnvDir: env.MCW_SESSION_ENV_DIR || path.join(claudeDir, 'session-env'),
   zellijBin: env.MCW_ZELLIJ_BIN || path.join(homeDir, '.local', 'bin', 'zellij'),
+  zjHelper: env.MCW_ZJ_HELPER || path.join(os.homedir(), '.local', 'bin', 'maxagent-zj'),
   zellijConfig: env.MCW_ZELLIJ_CONFIG || path.join(configHome, 'zellij', 'config.kdl'),
   webHost: env.MCW_WEB_HOST || '127.0.0.1',
   webPort: Number(env.MCW_WEB_PORT || 8082),

@@ -14,6 +14,8 @@ if [ "$1" = "list-sessions" ]; then
 fi
 `, { mode: 0o755 });
 process.env.MCW_ZELLIJ_BIN = fake;
+process.env.XDG_RUNTIME_DIR = dir;
+process.env.MCW_ZJ_HELPER ||= new URL('../../../bin/maxagent-zj', import.meta.url).pathname;
 const { listSessionNames, terminalSocketSession } = await import('../src/sessions.js');
 
 let failures = 0;

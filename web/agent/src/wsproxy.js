@@ -5,7 +5,8 @@ import { login } from './zellijweb.js';
 import { toWireError } from './errors.js';
 import { sendableCloseCode, clampCloseReason } from './wsclose.js';
 import { log } from './log.js';
-import { listSessionNames, terminalSocketSession } from './sessions.js';
+import { sessionNameIndex, terminalSocketSession } from './sessions.js';
+import { notRespondingError } from './zj.js';
 import { convertViewerLease, removeViewer } from './viewers.js';
 
 const STRIP = new Set([
@@ -47,16 +48,22 @@ export class WsProxy {
     // that and take the deleted name. Sessions are created only through sessions.create.
     const target = terminalSocketSession(msg.path);
     if (target !== null) {
-      let known;
+      let index = null;
       try {
-        known = target ? (await listSessionNames()).has(target) : false;
+        if (target) index = await sessionNameIndex();
       } catch (err) {
         this.open.delete(id);
         this.link.sendJson({ t: 'ws.err', id, error: toWireError(err) });
         return;
       }
-      if (!known) {
+      if (!index?.names.has(target)) {
         this.open.delete(id);
+        const stuck = index?.notResponding.find((session) => session.name === target);
+        if (stuck) {
+          log.warn('refused a terminal socket for a session that is not responding', { id, session: target, serverPid: stuck.serverPid });
+          this.link.sendJson({ t: 'ws.err', id, error: notRespondingError(target, { serverPid: stuck.serverPid }).toWire() });
+          return;
+        }
         log.info('refused a terminal socket for a session that does not exist', { id, session: target });
         this.link.sendJson({ t: 'ws.err', id, error: { code: 'not_found', message: `session ${target || '(unnamed)'} does not exist` } });
         return;

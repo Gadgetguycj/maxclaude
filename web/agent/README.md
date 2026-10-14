@@ -21,6 +21,7 @@ The defaults use the current user's home and configuration directories. The inst
 | `MCW_SESSION_ENV_DIR` | `$CLAUDE_CONFIG_DIR/session-env` | maxclaude session environment records. |
 | `MCW_ZELLIJ_BIN` | `$HOME/.local/bin/zellij` | zellij executable. |
 | `MCW_ZELLIJ_CONFIG` | `$XDG_CONFIG_HOME/zellij/config.kdl` | zellij configuration file. |
+| `MCW_ZJ_HELPER` | `$HOME/.local/bin/maxagent-zj` | The `maxagent-zj` command from this repository. Every zellij query that reaches a session goes through it. |
 | `MCW_WEB_HOST` | `127.0.0.1` | Local zellij web listen address. |
 | `MCW_WEB_PORT` | `8082` | Local zellij web listen port. |
 | `MCW_MAXCLAUDE_CFG` | `$XDG_CONFIG_HOME/maxclaude` | maxclaude session metadata directory. |
@@ -35,5 +36,7 @@ When enabled, automatic hibernation scans every ten minutes. It only hibernates 
 | `XDG_RUNTIME_DIR` | `/run/user/<uid>` | Per-user runtime directory. |
 | `MCW_BIN_DIR` | `$HOME/.local/bin` | Installer destination for the status helper. |
 | `MCW_INSTALL_ROOT` | `$HOME/.local/share/maxclaude/web/agent` | Installer destination for the agent code. |
+
+zellij's own session lookup waits without a limit on every session server, so one server that keeps its socket but stops answering hangs every zellij command. The agent therefore sends every session query through `maxagent-zj`. Such a server's socket is set aside. The session leaves the list and appears by name and server pid under `notResponding` in `sessions.list`, and a query to it fails with "session NAME is not responding". `sessions.delete` ends it with SIGKILL.
 
 The installer requires a working user systemd instance. Use `--no-start` to install and enable the service without restarting it. Re-running the installer updates its managed environment file and preserves Claude Code settings and unrelated hooks.

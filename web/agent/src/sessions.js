@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { run, runOrThrow, stripAnsi } from './exec.js';
+import { listZellijSessions, notRespondingError, notRespondingSessions, stopZellijSession, zellijSession } from './zj.js';
 import { RpcError } from './errors.js';
 import { log } from './log.js';
 import { collectSessionActivity, hiddenSessionActivity, readLiveClaudePanes, readSessionProcessSnapshot } from './status.js';
@@ -59,18 +60,10 @@ export function validateName(name) {
 }
 
 export async function listSessions() {
-  const res = await run(config.zellijBin, ['list-sessions', '-n'], { timeout: 15000 });
-  if (res.code !== 0 && !/No active zellij sessions/i.test(`${res.stdout}${res.stderr}`)) {
-    throw new RpcError('upstream_unavailable', 'zellij list-sessions failed', {
-      exitCode: res.code,
-      stdout: res.stdout.slice(-2000),
-      stderr: res.stderr.slice(-2000),
-    });
-  }
+  const { lines, notResponding } = await listZellijSessions();
+  const stuck = new Set(notResponding.map((session) => session.name));
   const sessions = [];
-  for (const raw of stripAnsi(res.stdout).split('\n')) {
-    const line = raw.trim();
-    if (!line) continue;
+  for (const line of lines) {
     const m = line.match(/^(\S+)\s*(?:\[([^\]]*)\])?\s*(.*)$/);
     if (!m) continue;
     const rest = `${m[2] || ''} ${m[3] || ''}`;
@@ -99,8 +92,8 @@ export async function listSessions() {
     session.operatorActive = operatorClients.ambiguous || operatorClients.sessions.has(session.name) || session.current;
   }
   const liveNames = new Set(sessions.map((session) => session.name));
-  sessions.push(...hiddenSessionRows().filter((session) => !liveNames.has(session.name)));
-  return { sessions };
+  sessions.push(...hiddenSessionRows().filter((session) => !liveNames.has(session.name) && !stuck.has(session.name)));
+  return { sessions, notResponding };
 }
 
 async function isResumableSession(name) {
@@ -165,8 +158,10 @@ export async function hibernateSession(params = {}) {
   const name = validateName(params.name);
   const automatic = params.automatic === true;
   return withSessionLocks([name], async () => {
-    const { sessions } = await listSessions();
+    const { sessions, notResponding } = await listSessions();
     const session = sessions.find((item) => item.name === name);
+    const stuck = notResponding.find((item) => item.name === name);
+    if (stuck) throw notRespondingError(name, { serverPid: stuck.serverPid });
     if (!session) throw new RpcError('not_found', `session ${name} is not known`, { name });
     const eligibility = hibernateEligibility(session, { automatic });
     if (!eligibility.eligible) throw new RpcError('conflict', `session ${name} cannot be hibernated: ${eligibility.reason}`, { name, reason: eligibility.reason });
@@ -269,27 +264,21 @@ export async function isLive(name) {
   return sessions.some((s) => s.name === name && !s.exited);
 }
 
+// A session whose server stopped answering still holds its name.
 async function isListed(name) {
-  const { sessions } = await listSessions();
-  return sessions.some((s) => s.name === name);
+  const { sessions, notResponding } = await listSessions();
+  return sessions.some((s) => s.name === name) || notResponding.some((s) => s.name === name);
 }
 
-// Session names zellij knows, live or exited, without the per-session activity scan.
+// Session names zellij knows, live or exited, without the per-session activity
+// scan. A session whose server stopped answering is left out and reported apart.
+export async function sessionNameIndex() {
+  const { lines, notResponding } = await listZellijSessions();
+  return { names: new Set(lines.map((line) => line.split(/\s/)[0])), notResponding };
+}
+
 export async function listSessionNames() {
-  const res = await run(config.zellijBin, ['list-sessions', '-n'], { timeout: 15000 });
-  if (res.code !== 0 && !/No active zellij sessions/i.test(`${res.stdout}${res.stderr}`)) {
-    throw new RpcError('upstream_unavailable', 'zellij list-sessions failed', {
-      exitCode: res.code,
-      stderr: res.stderr.slice(-2000),
-    });
-  }
-  const names = new Set();
-  for (const raw of stripAnsi(res.stdout).split('\n')) {
-    const line = raw.trim();
-    if (!line || /^No active zellij sessions/i.test(line)) continue;
-    names.add(line.split(/\s/)[0]);
-  }
-  return names;
+  return (await sessionNameIndex()).names;
 }
 
 // The session a terminal socket path names, '' for the nameless path, or null for any other path.
@@ -431,9 +420,7 @@ function attachedOperatorSessions(knownNames = []) {
 }
 
 async function terminalPaneIds(name) {
-  const res = await runOrThrow(config.zellijBin, [
-    '-s', name, 'action', 'list-panes', '--json', '--command', '--state',
-  ], { timeout: 15000 });
+  const res = await zellijSession(name, ['action', 'list-panes', '--json', '--command', '--state']);
   let panes;
   try {
     panes = JSON.parse(res.stdout);
@@ -457,9 +444,7 @@ async function terminalPaneIds(name) {
 }
 
 async function dumpPane(name, paneId) {
-  const res = await runOrThrow(config.zellijBin, [
-    '-s', name, 'action', 'dump-screen', '--full', '--pane-id', paneId,
-  ], { timeout: 15000 });
+  const res = await zellijSession(name, ['action', 'dump-screen', '--full', '--pane-id', paneId]);
   return stripAnsi(res.stdout);
 }
 
@@ -469,12 +454,8 @@ function renameReported(screen, name) {
 }
 
 async function renameClaudePane(sessionName, paneId, newName) {
-  await runOrThrow(config.zellijBin, [
-    '-s', sessionName, 'action', 'write-chars', '--pane-id', paneId, `/rename ${newName}`,
-  ], { timeout: 15000 });
-  await runOrThrow(config.zellijBin, [
-    '-s', sessionName, 'action', 'send-keys', '--pane-id', paneId, 'Enter',
-  ], { timeout: 15000 });
+  await zellijSession(sessionName, ['action', 'write-chars', '--pane-id', paneId, `/rename ${newName}`]);
+  await zellijSession(sessionName, ['action', 'send-keys', '--pane-id', paneId, 'Enter']);
 
   const deadline = Date.now() + 12000;
   let screen = '';
@@ -573,6 +554,8 @@ async function createSessionLocked(params, name) {
   if (await isLive(name)) {
     throw new RpcError('conflict', `session ${name} is already running`, { name });
   }
+  const stuck = (await notRespondingSessions()).find((session) => session.name === name);
+  if (stuck) throw notRespondingError(name, { serverPid: stuck.serverPid });
 
   const envFile = path.join(config.maxclaudeCfg, 'sessions', `${name}.env`);
   const panesFile = path.join(config.maxclaudeCfg, `${name}.panes`);
@@ -625,11 +608,13 @@ export async function renameSession(params = {}) {
 async function renameSessionLocked(oldName, newName) {
   if (oldName === newName) return { oldName, newName, renamed: false };
 
-  const sessions = (await listSessions()).sessions;
+  const { sessions, notResponding } = await listSessions();
+  const stuck = notResponding.find((session) => session.name === oldName);
+  if (stuck) throw notRespondingError(oldName, { serverPid: stuck.serverPid });
   if (!sessions.some((session) => session.name === oldName && !session.exited)) {
     throw new RpcError('not_found', `session ${oldName} is not running`, { oldName });
   }
-  if (sessions.some((session) => session.name === newName)) {
+  if (sessions.some((session) => session.name === newName) || notResponding.some((session) => session.name === newName)) {
     throw new RpcError('conflict', `session ${newName} already exists`, { newName });
   }
 
@@ -664,9 +649,7 @@ async function renameSessionLocked(oldName, newName) {
   let panesMoved = false;
   let units = null;
   try {
-    await runOrThrow(config.zellijBin, [
-      '-s', oldName, 'action', 'rename-session', newName,
-    ], { timeout: 15000 });
+    await zellijSession(oldName, ['action', 'rename-session', newName]);
     zellijRenamed = true;
 
     envMoved = moveExistingFile(oldFiles.env, newFiles.env);
@@ -699,9 +682,7 @@ async function renameSessionLocked(oldName, newName) {
     const activeName = zellijRenamed ? newName : oldName;
     if (zellijRenamed) {
       try {
-        await runOrThrow(config.zellijBin, [
-          '-s', newName, 'action', 'rename-session', oldName,
-        ], { timeout: 15000 });
+        await zellijSession(newName, ['action', 'rename-session', oldName]);
       } catch { /* report the original error */ }
     }
     if (envMoved && fs.existsSync(newFiles.env) && !fs.existsSync(oldFiles.env)) {
@@ -730,7 +711,7 @@ async function deleteSessionLocked(name) {
   const unit = `maxclaude-named@${escaped}.service`;
 
   const stopped = await run('systemctl', ['--user', 'stop', unit], { timeout: 60000 });
-  const deleted = await run(config.zellijBin, ['delete-session', '--force', name], { timeout: 30000 });
+  const deleted = await stopZellijSession(name);
 
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
