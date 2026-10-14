@@ -362,6 +362,8 @@ _watch(){
   done < <(_stuck)
 }
 
+_is_stuck(){ _stuck | cut -f1 | grep -qxF -- "$1"; }
+
 _stuck_message(){
   local name="$1" pid since
   pid="$(_info "$name" pid)"
@@ -396,7 +398,7 @@ _run(){
   shift
   sock="$SOCK_DIR/$name"
   if [ ! -S "$sock" ]; then
-    if _stuck | cut -f1 | grep -qxF -- "$name"; then
+    if _is_stuck "$name"; then
       _stuck_message "$name"
       return 69
     fi
@@ -412,13 +414,28 @@ _run(){
       return "$rc" ;;
     *) return "$rc" ;;
   esac
+  # Another caller may have set the socket aside while this call waited.
+  if [ ! -S "$sock" ] && _is_stuck "$name"; then
+    _stuck_message "$name"
+    return 69
+  fi
   state="$(_probe "$sock")"
   [ "$state" = noreply ] && state="$(_probe "$sock")"
   case "$state" in
     noreply)
-      _set_aside "$name" || _log "session '$name' is not responding: its zellij server did not answer within ${PROBE_SECS}s, twice, and its socket could not be moved aside"
+      if ! _set_aside "$name"; then
+        if _is_stuck "$name"; then
+          _stuck_message "$name"
+        else
+          _log "session '$name' is not responding: its zellij server did not answer within ${PROBE_SECS}s, twice, and its socket could not be moved aside"
+        fi
+      fi
       return 69 ;;
     gone)
+      if _is_stuck "$name"; then
+        _stuck_message "$name"
+        return 69
+      fi
       echo "$APP: zellij session '$name' ended while 'zellij $*' ran" >&2
       return 1 ;;
     *)
