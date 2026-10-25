@@ -34,21 +34,25 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1 || true; done
   for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1 || true; done
   systemctl --user disable --now maxagent-zj-watch.timer >/dev/null 2>&1 || true
+  for unit in maxrouter-blockd maxrouter-heartbeat maxrouter-notify maxrouter-web; do
+    systemctl --user disable --now "$unit.service" >/dev/null 2>&1 || true
+  done
 fi
 
-rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-zj"
+rm -f "$BIN_DIR/maxagent" "$BIN_DIR/maxcodex" "$BIN_DIR/maxagent-pane" "$BIN_DIR/maxagent-svc" "$BIN_DIR/maxagent-zj" "$BIN_DIR/maxagent-usage"
+for name in maxrouter maxrouter-webd mxr mxr-blockd mxr-heartbeatd mxr-notify mxr-notifyd mxr-outbox; do rm -f "$BIN_DIR/$name"; done
 if [ -z "$KEEP_LEGACY" ]; then
-  rm -f "$BIN_DIR/maxclaude" "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
+  rm -f "$BIN_DIR/maxclaude" "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane" "$BIN_DIR/maxclaude-restore"
 fi
 rm -f "$LAYOUT_DIR"/agent{1,2,3,4}.kdl
 rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
-rm -f "$UNIT_DIR/maxagent-named@.service" "$UNIT_DIR/maxagent-zj-watch.service" "$UNIT_DIR/maxagent-zj-watch.timer"
+rm -f "$UNIT_DIR/maxagent-named@.service" "$UNIT_DIR/maxagent-zj-watch.service" "$UNIT_DIR/maxagent-zj-watch.timer" "$UNIT_DIR"/maxrouter-*.service
 if [ -z "$KEEP_LEGACY" ]; then
   rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
   rm -rf "$CFG_DIR/maxclaude"
 fi
 rm -rf "$CFG_DIR/maxagent"
-command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then systemctl --user daemon-reload 2>/dev/null || true; fi
 
 if [ -n "$REMOVE_ZELLIJ" ]; then rm -f "$BIN_DIR/zellij"; echo "removed $BIN_DIR/zellij"; fi
 echo "maxagent uninstalled. (PATH line in your shell rc, if added, was left in place.)"
