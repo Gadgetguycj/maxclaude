@@ -1,0 +1,19 @@
+// maxclaude 4 - four persistent Claude panes in a 2x2 grid.
+layout {
+    pane_template name="cc" {
+        command "bash"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+    }
+    tab name="claude" focus=true {
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" {
+                cc
+                cc
+            }
+            pane split_direction="vertical" {
+                cc
+                cc
+            }
+        }
+    }
+}

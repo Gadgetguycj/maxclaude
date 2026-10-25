@@ -1,0 +1,13 @@
+// maxclaude 2 - two persistent Claude panes, side by side (left/right).
+layout {
+    pane_template name="cc" {
+        command "bash"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+    }
+    tab name="claude" focus=true {
+        pane split_direction="vertical" {
+            cc
+            cc
+        }
+    }
+}

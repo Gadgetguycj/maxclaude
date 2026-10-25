@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
+zj="${MAXCLAUDE_ZELLIJ_BIN:-${MAXAGENT_ZELLIJ:-$HOME/.local/bin/zellij}}"
+mz="$(dirname "$0")/maxagent-zj"
+projects="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+restore_one() {
+  local name="$1" sid="$2" workdir="${3:-$HOME}" panes="${4:-1}"
+  [ -n "$name" ] && [ -n "$sid" ] || return 0
+  if ! find "$projects" -type f -name "$sid.jsonl" -print -quit 2>/dev/null | grep -q .; then
+    printf 'SKIP %s: transcript missing\n' "$name" >&2
+    return 0
+  fi
+  case "$(MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$zj" "$mz" state "$name")" in
+    live) printf 'LIVE %s\n' "$name"; return 0 ;;
+    stuck) printf 'STUCK %s\n' "$name" >&2; return 0 ;;
+  esac
+  mkdir -p "$cfg/sessions"
+  printf 'MAXCLAUDE_WORKDIR=%s\nMAXCLAUDE_RESUME_SID=%s\n' "$workdir" "$sid" > "$cfg/sessions/$name.env"
+  case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+  printf '%s\n' "$panes" > "$cfg/$name.panes"
+  systemctl --user start "maxclaude-named@$(systemd-escape "$name").service"
+  printf 'START %s\n' "$name"
+}
+if [ -f "$cfg/restore.tsv" ]; then
+  while IFS=$'\t' read -r name sid workdir panes; do
+    restore_one "$name" "$sid" "$workdir" "$panes"
+  done < "$cfg/restore.tsv"
+fi
+for envfile in "$cfg"/sessions/*.env; do
+  [ -f "$envfile" ] || continue
+  name="$(basename "$envfile" .env)"
+  sid="$(sed -n 's/^MAXCLAUDE_RESUME_SID=//p' "$envfile" | head -n1)"
+  [ -n "$sid" ] || continue
+  restore_one "$name" "$sid" "$(sed -n 's/^MAXCLAUDE_WORKDIR=//p' "$envfile" | head -n1)" "$(cat "$cfg/$name.panes" 2>/dev/null || printf 1)"
+done

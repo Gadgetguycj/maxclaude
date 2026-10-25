@@ -3,5 +3,6 @@ Description=Set aside zellij sessions whose server stopped answering
 
 [Service]
 Type=oneshot
+Environment=MAXAGENT_APP=maxclaude
 ExecStart=%h/.local/bin/maxagent-zj watch
 TimeoutStartSec=120

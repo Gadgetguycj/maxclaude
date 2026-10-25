@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # maxagent installer.
 #
-# Installs maxagent, maxcodex, maxclaude compatibility wrappers, zellij layouts,
+# Installs maxagent, maxcodex, maxclaude session tools, zellij layouts,
 # provider profiles, optional per-user systemd services, and zellij if missing.
 #
 # Quick start (from a clone):     ./install.sh --provider codex
@@ -37,6 +37,7 @@ WANT_SYSTEMD="auto"
 PROVIDER_EXPLICIT=""
 
 BIN_DIR="$HOME/.local/bin"
+USER_NAME="$(id -un)"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
 AGENT_CFG_DIR="$CFG_DIR/maxagent"
 PROFILE_DIR="$AGENT_CFG_DIR/profiles"
@@ -130,8 +131,10 @@ fi
 # given. A prior Claude-only "maxclaude" install (no ~/.config/maxagent) keeps
 # defaulting to Claude instead of silently flipping to Codex.
 PREV_PROVIDER=""
-[ -r "$AGENT_CFG_DIR/defaults.env" ] && \
+if [ -r "$AGENT_CFG_DIR/defaults.env" ]; then
+  # shellcheck disable=SC1090,SC1091
   PREV_PROVIDER="$(. "$AGENT_CFG_DIR/defaults.env" 2>/dev/null; printf '%s' "${MAXAGENT_DEFAULT_PROVIDER:-}")"
+fi
 if [ -z "$PROVIDER_EXPLICIT" ]; then
   if [ -n "$PREV_PROVIDER" ]; then
     DEFAULT_PROVIDER="$PREV_PROVIDER"
@@ -143,7 +146,7 @@ elif [ -n "$PREV_PROVIDER" ] && [ "$PREV_PROVIDER" != "$DEFAULT_PROVIDER" ]; the
 fi
 case "$DEFAULT_PROVIDER" in codex|claude) ;; *) DEFAULT_PROVIDER="codex" ;; esac
 
-SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null || exit; pwd)"
 have_sources(){ [ -f "$SRC_DIR/bin/maxagent" ] && [ -d "$SRC_DIR/layouts" ]; }
 if ! have_sources; then
   step "Fetching maxagent sources"
@@ -187,7 +190,7 @@ say "  persistence  : $([ -n "$USE_SYSTEMD" ] && echo 'systemd --user service (s
 step "Dependency: zellij"
 mkdir -p "$BIN_DIR"
 install_zellij_from_release(){
-  [ -n "$zarch" ] && [ -n "$zplat" ] || die "no zellij prebuilt for $uname_s/$uname_m — install zellij manually then re-run"
+  if [ -z "$zarch" ] || [ -z "$zplat" ]; then die "no zellij prebuilt for $uname_s/$uname_m: install zellij manually then re-run"; fi
   local asset="zellij-${zarch}-${zplat}.tar.gz" url tmp
   url="https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/${asset}"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
@@ -246,15 +249,15 @@ install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
 install -m 0755 "$SRC_DIR/bin/maxagent-zj" "$BIN_DIR/maxagent-zj"
-# Drop artifacts from older maxclaude installs that this layout no longer uses
-# (maxclaude-svc is now just maxagent-svc; the per-pane launcher is maxagent-pane).
-rm -f "$BIN_DIR/maxclaude-svc" "$BIN_DIR/maxclaude-pane"
-ok "commands  -> $BIN_DIR/maxagent, maxcodex, maxclaude"
+for name in maxclaude-pane maxclaude-svc maxclaude-restore maxrouter maxrouter-webd mxr mxr-blockd mxr-heartbeatd mxr-notify mxr-notifyd mxr-outbox; do
+  install -m 0755 "$SRC_DIR/bin/$name" "$BIN_DIR/$name"
+done
+ok "commands  -> $BIN_DIR (session and router tools)"
 
 mkdir -p "$LAYOUT_DIR"
 install -m 0644 "$SRC_DIR"/layouts/agent{1,2,3,4}.kdl "$LAYOUT_DIR/"
-rm -f "$LAYOUT_DIR"/cc{1,2,3,4}.kdl
-ok "layouts   -> $LAYOUT_DIR/agent{1,2,3,4}.kdl"
+install -m 0644 "$SRC_DIR"/layouts/cc{1,2,3,4}.kdl "$LAYOUT_DIR/"
+ok "layouts   -> $LAYOUT_DIR/agent{1,2,3,4}.kdl and cc{1,2,3,4}.kdl"
 
 mkdir -p "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR"
 chmod 0700 "$AGENT_CFG_DIR" "$PROFILE_DIR" "$SESSION_DIR" 2>/dev/null || true
@@ -329,21 +332,17 @@ EOF
 if [ -n "$USE_SYSTEMD" ]; then
   mkdir -p "$UNIT_DIR"
   install -m 0644 "$SRC_DIR/systemd/maxagent-named@.service" "$UNIT_DIR/"
-  # Remove legacy units from older installs: every session now runs under
-  # maxagent-named@; maxagent still stops any pre-existing maxclaude@ units.
-  # Deliberately NOT stopped here: the old units' ExecStop deletes the zellij
-  # session, so stopping live ones mid-upgrade would kill running sessions.
-  # Any leftover ghost unit is cleaned by 'maxagent close' / 'maxagent prune'.
-  rm -f "$UNIT_DIR/maxclaude@.service" "$UNIT_DIR/maxclaude-named@.service"
+  install -m 0644 "$SRC_DIR/systemd/maxclaude@.service" "$SRC_DIR/systemd/maxclaude-named@.service" "$UNIT_DIR/"
+  install -m 0644 "$SRC_DIR"/systemd/maxrouter-*.service "$UNIT_DIR/"
   # Every minute, set aside a zellij server that stopped answering, so it cannot
   # hang zellij for the other sessions.
   install -m 0644 "$SRC_DIR/systemd/maxagent-zj-watch.service" "$SRC_DIR/systemd/maxagent-zj-watch.timer" "$UNIT_DIR/"
   systemctl --user daemon-reload 2>/dev/null || true
   systemctl --user enable --now maxagent-zj-watch.timer >/dev/null 2>&1 \
     || warn "could not enable maxagent-zj-watch.timer"
-  ok "services  -> $UNIT_DIR/maxagent-named@.service, maxagent-zj-watch.timer"
-  if ! loginctl enable-linger "$USER" >/dev/null 2>&1; then
-    warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER"
+  ok "services  -> $UNIT_DIR/maxagent-named@.service, maxclaude-named@.service, maxagent-zj-watch.timer"
+  if ! loginctl enable-linger "$USER_NAME" >/dev/null 2>&1; then
+    warn "could not enable lingering automatically. For sessions to survive logout, run: sudo loginctl enable-linger $USER_NAME"
   else
     ok "lingering enabled (sessions survive SSH disconnect)"
   fi
@@ -366,12 +365,12 @@ esac
 
 step "Done"
 say "Start a Codex session:"
-say "  ${c_bold}maxcodex${c_off}        # 2x2 grid of 4 Codex panes"
+say "  ${c_bold}maxcodex${c_off}        # one Codex pane"
 say "  ${c_bold}maxcodex 2${c_off}      # two Codex panes"
 say "  ${c_bold}maxcodex work${c_off}   # named Codex workspace"
 say ""
-say "Claude compatibility still works:"
-say "  ${c_bold}maxclaude${c_off}       # legacy Claude workspace"
+say "Claude sessions:"
+say "  ${c_bold}maxclaude work${c_off}  # named Claude session"
 say ""
 say "Manage:   maxagent ls   |   maxagent attach <n>   |   maxagent close <n>"
 say "Detach:   Ctrl-o then d        Move panes: Alt+arrows        Close window: Ctrl-q"

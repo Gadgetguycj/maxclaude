@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# maxclaude-svc start|stop <session>
+# Invoked by maxclaude-named@.service to (re)create or tear down a persistent,
+# background zellij workspace. The pane count is read from the per-session state
+# file written by the `maxclaude` shell function (defaults to 1). No secrets here.
+# Session checks and teardown go through maxagent-zj, so a zellij server that
+# stops answering cannot hang the unit.
+set -euo pipefail
+ZJ="${MAXAGENT_ZELLIJ:-${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}}"
+MZ="$(dirname "$0")/maxagent-zj"
+export MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="$ZJ"
+action="${1:?usage: maxclaude-svc start|stop <session>}"
+name="${2:?usage: maxclaude-svc start|stop <session>}"
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
+panes="$(cat "$cfg/${name}.panes" 2>/dev/null || echo 1)"
+case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+case "$action" in
+  start)
+    case "$("$MZ" state "$name")" in
+      live) exit 0 ;;
+      stuck)
+        echo "maxclaude-svc: session '$name' is not responding, so it was not started again. End it with: maxclaude close $name" >&2
+        exit 1 ;;
+    esac
+    exec "$ZJ" --layout "cc${panes}" attach --create-background "$name"
+    ;;
+  stop)  exec "$MZ" stop "$name" ;;
+  *) echo "unknown action: $action (want start|stop)" >&2; exit 2 ;;
+esac

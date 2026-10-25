@@ -1,14 +1,13 @@
-# maxagent
+# maxclaude
 
-Run **1-4 Codex or Claude panes in one terminal** with persistent zellij
-sessions. This is useful on a Linux dev server: start multiple agent panes,
-detach, close SSH, reconnect later, and attach to the same running workspace.
+Run Codex or Claude Code in persistent Zellij sessions. A named Claude session
+starts with one pane. You can detach and reattach without ending the session.
 
 ```bash
-maxcodex          # 2x2 grid of 4 Codex panes
+maxcodex 4        # 2x2 grid of 4 Codex panes
 maxcodex 2        # two Codex panes
 maxcodex work     # named Codex workspace
-maxclaude         # Claude compatibility command
+maxclaude work    # one named Claude session
 ```
 
 ```
@@ -17,7 +16,7 @@ maxclaude         # Claude compatibility command
 ├───────────────┼───────────────┤
 │   agent #3    │   agent #4    │
 └───────────────┴───────────────┘
-        maxagent
+        maxagent 4
 ```
 
 ## Install
@@ -42,10 +41,10 @@ permission mode. Add `--yes` to accept the defaults without prompting (see
 
 The installer:
 
-- installs `maxagent`, `maxcodex`, and the compatibility `maxclaude` command;
+- installs `maxagent`, `maxcodex`, `maxclaude`, session recovery tools, and the optional router tools;
 - installs zellij into `~/.local/bin` if zellij is missing;
 - writes provider profiles under `~/.config/maxagent/profiles`;
-- installs the `agent{1,2,3,4}` zellij layouts;
+- installs the `agent{1,2,3,4}` and `cc{1,2,3,4}` Zellij layouts;
 - installs per-user systemd services on Linux when available;
 - enables systemd lingering (`loginctl enable-linger`) on systemd hosts so
   sessions survive SSH disconnects;
@@ -115,7 +114,7 @@ maxagent 4 --yolo
 Start Codex:
 
 ```bash
-maxcodex          # 4 panes
+maxcodex          # 1 pane
 maxcodex 1        # 1 pane
 maxcodex 2        # 2 panes
 maxcodex work     # named workspace
@@ -126,7 +125,7 @@ maxcodex 3 --yolo # 3 panes with Codex approval/sandbox bypass
 Start Claude:
 
 ```bash
-maxclaude         # legacy Claude command
+maxclaude work    # one named Claude session
 maxagent claude 2 # explicit provider form
 maxclaude 2 --yolo # Claude with --dangerously-skip-permissions
 ```
@@ -193,8 +192,8 @@ If the installer generated an absolute Codex path or an `export PATH=...` line
 for nvm, keep those parts and add flags after the `--cd` argument:
 
 ```bash
-export PATH='/root/.nvm/versions/node/v24.16.0/bin':$PATH
-exec '/root/.nvm/versions/node/v24.16.0/bin/codex' --cd '/root/Projects' --model gpt-5.4 "$@"
+export PATH="$HOME/.local/bin:$PATH"
+exec codex --cd "$HOME/projects" "$@"
 ```
 
 Claude panes work the same way: `maxclaude` launches `claude`, and Claude Code
@@ -242,15 +241,14 @@ started. Every stop also waits for the server to exit and kills it if it is
 still running 10 seconds after it was asked to end. On systemd hosts,
 `maxagent-zj-watch.timer` runs the same check every minute.
 
-`test/unresponsive-session.sh <bin dir>` reproduces the failure by stopping one
-server with SIGSTOP in a private zellij socket directory. It needs Linux.
+`test/unresponsive-session.sh <bin dir>` reproduces stalled servers in a private
+Zellij socket directory. It needs Linux.
 
-## Upgrading from maxclaude
+## Upgrade
 
-If you previously installed the Claude-only `maxclaude` and have sessions still
-running, run `maxclaude close all` once (or just reboot) after re-installing, so
-the old per-session systemd units are replaced by the new `maxagent-named@`
-units. Your `maxclaude` command keeps working and still opens Claude panes.
+Pull the release and rerun `./install.sh` with your existing provider and
+working directory. Reattach named sessions with `maxclaude attach <name>` or
+`maxagent attach <name>`.
 
 ## Uninstall
 
@@ -263,3 +261,7 @@ units. Your `maxclaude` command keeps working and still opens Claude panes.
 ## License
 
 [MIT](LICENSE).
+
+## Browser interface
+
+The optional browser interface lives in [maxclaude-web](https://github.com/Gadgetguycj/maxclaude-web). Install this repository on the session machine before setting up its agent.

@@ -1,0 +1,18 @@
+[Unit]
+Description=Persistent Claude Code zellij session max%i
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+# Start and stop never wait forever. maxclaude-svc checks sessions through
+# maxagent-zj; these limits cover anything else that could block.
+TimeoutStartSec=90
+TimeoutStopSec=60
+Environment=TERM=xterm-256color
+Environment=COLORTERM=truecolor
+ExecStart=%h/.local/bin/maxclaude-svc start max%i %i
+ExecStop=%h/.local/bin/maxclaude-svc stop max%i
+
+# No Install section. Sessions survive disconnects but never respawn on reboot.
