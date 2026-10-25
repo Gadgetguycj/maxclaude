@@ -249,7 +249,7 @@ install -m 0755 "$SRC_DIR/bin/maxclaude" "$BIN_DIR/maxclaude"
 install -m 0755 "$SRC_DIR/bin/maxagent-pane" "$BIN_DIR/maxagent-pane"
 install -m 0755 "$SRC_DIR/bin/maxagent-svc" "$BIN_DIR/maxagent-svc"
 install -m 0755 "$SRC_DIR/bin/maxagent-zj" "$BIN_DIR/maxagent-zj"
-for name in maxagent-usage maxclaude-pane maxclaude-svc maxclaude-restore maxrouter maxrouter-webd mxr mxr-blockd mxr-heartbeatd mxr-notify mxr-notifyd mxr-outbox; do
+for name in maxclaude-pane maxclaude-svc maxclaude-restore maxrouter maxrouter-webd mxr mxr-blockd mxr-heartbeatd mxr-notify mxr-notifyd mxr-outbox; do
   install -m 0755 "$SRC_DIR/bin/$name" "$BIN_DIR/$name"
 done
 ok "commands  -> $BIN_DIR (session and router tools)"
