@@ -1,0 +1,10 @@
+// maxclaude 1 - single persistent Claude pane.
+layout {
+    pane_template name="cc" {
+        command "bash"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+    }
+    tab name="claude" focus=true {
+        cc
+    }
+}

@@ -1,11 +1,318 @@
 #!/usr/bin/env bash
-set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ ! -x "$DIR/maxagent" ]; then
-  echo "maxclaude: maxagent not found at $DIR/maxagent. Re-run the installer (install.sh)." >&2
-  exit 127
-fi
-export MAXAGENT_DEFAULT_PROVIDER=claude
-export MAXAGENT_SESSION_PREFIX=legacy
-export MAXAGENT_APP=maxclaude
-exec "$DIR/maxagent" "$@"
+_maxclaude_zj(){ MAXAGENT_APP=maxclaude MAXAGENT_ZELLIJ="${MAXAGENT_ZELLIJ:-$HOME/.local/bin/zellij}" "$(dirname "$0")/maxagent-zj" "$@"; }
+_maxclaude_stuck_names(){ _maxclaude_zj stuck | cut -f1; }
+_maxclaude_refuse_stuck(){
+  local stuck; stuck="$(_maxclaude_stuck_names)"
+  grep -qxF "$1" <<<"$stuck" || return 0
+  echo "maxclaude: session '$1' is not responding (its zellij server stopped answering)." >&2
+  echo "End it with: maxclaude close $1    or keep its conversation with: maxclaude hide $1" >&2
+  return 1
+}
+
+# Map a session name to its systemd --user unit instance.
+_maxclaude_unit_for(){
+  case "$1" in
+    max[1-4]) printf 'maxclaude@%s.service\n' "${1#max}" ;;
+    [1-4])    printf 'maxclaude@%s.service\n' "$1" ;;
+    *)        printf 'maxclaude-named@%s.service\n' "$(systemd-escape "$1")" ;;
+  esac
+}
+
+# Is this session wired to come back on boot? True only if someone explicitly
+# `systemctl --user enable`d its unit — the maxclaude function never does that
+# anymore, so this is normally false for every session.
+_maxclaude_is_boot_enabled(){
+  [ "$(systemctl --user is-enabled "$(_maxclaude_unit_for "$1")" 2>/dev/null)" = enabled ]
+}
+
+# Garbage-collect dead state: delete EXITED zellij tombstones, and stop any
+# still-active maxclaude unit whose zellij session is no longer live. Leaves only
+# genuinely running sessions behind. (Long-inactive units already stopped in a
+# prior login linger in the user manager's loaded set until the next reboot, but
+# they're inert/static and never surface in `maxclaude ls`.)
+_maxclaude_prune(){
+  local u inst name
+  local live; live="$(_maxclaude_zj live)"
+  # A stuck session is not gone: it is listed and left for the operator to end.
+  local stuck; stuck="$(_maxclaude_stuck_names)"
+  # 1) drop EXITED zellij tombstones
+  _maxclaude_zj exited | while IFS= read -r name; do
+    [ -n "$name" ] && _maxclaude_zj forget "$name" >/dev/null 2>&1
+  done
+  # 2) stop any ACTIVE maxclaude unit whose session is not live
+  for u in $(systemctl --user list-units 'maxclaude@*' 'maxclaude-named@*' --no-legend 2>/dev/null | awk '{print $1}'); do
+    inst="${u%.service}"
+    case "$u" in
+      maxclaude@*)       name="max${inst#maxclaude@}" ;;
+      maxclaude-named@*) name="$(systemd-escape -u "${inst#maxclaude-named@}")" ;;
+      *) continue ;;
+    esac
+    grep -qxF "$name" <<<"$live" && continue
+    grep -qxF "$name" <<<"$stuck" && continue
+    systemctl --user stop "$u" >/dev/null 2>&1
+    systemctl --user reset-failed "$u" >/dev/null 2>&1
+  done
+}
+
+# Canonical, ordered, de-duplicated list of LIVE session names (one per line).
+# Only genuinely running zellij sessions — EXITED tombstones and dead systemd
+# units are excluded. `maxclaude ls`/`attach`/`close` number this list, so the
+# indices always line up and never point at a dead session.
+_maxclaude_sessions(){
+  _maxclaude_zj live | awk 'NF && !seen[$0]++'
+}
+
+# Close one session by name or number: stop its --user unit, then kill+delete it.
+_maxclaude_close(){
+  local sess="$1"
+  case "$sess" in [1-4]) sess="max${sess}" ;; esac
+  # disable --now also clears any stray boot enablement, then stops the unit.
+  systemctl --user disable --now "$(_maxclaude_unit_for "$sess")" >/dev/null 2>&1
+  # Ends the server even when it has no unit or ignores the request to quit.
+  if ! _maxclaude_zj stop "$sess"; then
+    echo "maxclaude: could not confirm that session '$sess' ended; see the message above." >&2
+    return 1
+  fi
+  echo "Closed session: $sess."
+}
+
+# Create-or-attach a numbered (max1..max4) or named session. Idempotent. Uses
+# `systemctl --user start` (NOT enable) so the session survives SSH disconnect
+# via linger but never respawns on boot.
+_maxclaude_open(){
+  local ZJ="${MAXAGENT_ZELLIJ:-${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}}"
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
+  local sel="$1" panes="${2:-}"
+
+  if [ -n "${ZELLIJ:-}" ]; then
+    echo "Already inside a zellij session (${ZELLIJ_SESSION_NAME:-?})." >&2
+    echo "Detach with Ctrl-o d, then run maxclaude from a plain shell to (re)attach." >&2
+    return 1
+  fi
+
+  # "max1".."max4" spelled out -> treat as the numbered session.
+  case "$sel" in max[1-4]) sel="${sel#max}" ;; esac
+
+  # Numbered sessions keep the classic layout-per-count behavior.
+  case "$sel" in
+    1|2|3|4)
+      local n="$sel"
+      # Checks every session first, setting aside any stuck server so the
+      # attach below cannot hang on it.
+      case "$(_maxclaude_zj state "max${n}")" in
+        stuck) _maxclaude_refuse_stuck "max${n}"; return 1 ;;
+        live) "$ZJ" attach "max${n}"; return ;;
+      esac
+      loginctl enable-linger "$(id -un)" >/dev/null 2>&1
+      systemctl --user start "maxclaude@${n}.service" >/dev/null 2>&1 \
+        || { echo "Failed to start maxclaude@${n}.service:" >&2; systemctl --user status "maxclaude@${n}.service" --no-pager | head; return 1; }
+      "$ZJ" attach "max${n}"
+      return ;;
+  esac
+
+  # Named workspace: <name> [panes]. Re-running the same name re-opens it.
+  local name="$sel"
+  local safe; safe="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '-')"
+  if [ -z "$safe" ] || [ "$safe" = "-" ]; then echo "invalid session name: $name" >&2; return 2; fi
+  # No explicit pane count: reuse an existing <name>.panes so attach/reopen
+  # can't clobber the session's shape; default to 1 only when no file exists.
+  if [ -z "$panes" ] && [ -r "$cfg/${safe}.panes" ]; then
+    panes="$(head -n1 "$cfg/${safe}.panes" 2>/dev/null)"
+  fi
+  case "$panes" in 1|2|3|4) ;; *) panes=1 ;; esac
+  mkdir -p "$cfg"; printf '%s\n' "$panes" > "$cfg/${safe}.panes"
+  # Org-scoped workspace: if the name matches an orgs.json name/alias (case-
+  # insensitive), write the pane env file so maxclaude-pane cd's into the org
+  # workdir. Non-org names get no env file and behave exactly as before.
+  if [ -f "$cfg/orgs.json" ]; then
+    local orgrow; orgrow="$(jq -r --arg n "$safe" '
+      .orgs[] | select((.name|ascii_downcase) == ($n|ascii_downcase)
+                       or ([.aliases[]?|ascii_downcase] | index($n|ascii_downcase)))
+      | [.name, .workdir] | @tsv' "$cfg/orgs.json" 2>/dev/null | head -n1)"
+    if [ -n "$orgrow" ]; then
+      mkdir -p "$cfg/sessions"
+      printf 'MAXCLAUDE_ORG=%s\nMAXCLAUDE_WORKDIR=%s\n' \
+        "${orgrow%%$'\t'*}" "${orgrow#*$'\t'}" > "$cfg/sessions/${safe}.env"
+    fi
+  fi
+  case "$(_maxclaude_zj state "$safe")" in
+    stuck) _maxclaude_refuse_stuck "$safe"; return 1 ;;
+    live) "$ZJ" attach "$safe"; return ;;
+  esac
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1
+  local esc; esc="$(systemd-escape "$safe")"
+  systemctl --user start "maxclaude-named@${esc}.service" >/dev/null 2>&1 \
+    || { echo "Failed to start maxclaude-named@${safe}.service:" >&2; systemctl --user status "maxclaude-named@${esc}.service" --no-pager | head; return 1; }
+  "$ZJ" attach "$safe"
+}
+
+# Bare `maxclaude` (no args): a quick, single-pane, THROWAWAY session. Unlike the
+# numbered/named sessions, this one is deliberately NOT persisted -- no systemd
+# unit, no linger, no resurrection state. It runs in the foreground and is
+# force-deleted when you close it OR the SSH connection drops, so it never
+# lingers in `maxclaude ls`. Want a session that survives disconnect? Use a
+# numbered (`maxclaude 1`) or named (`maxclaude work`) session instead.
+_maxclaude_ephemeral(){
+  local ZJ="${MAXAGENT_ZELLIJ:-${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}}"
+  if [ -n "${ZELLIJ:-}" ]; then
+    echo "Already inside a zellij session (${ZELLIJ_SESSION_NAME:-?})." >&2
+    echo "Detach with Ctrl-o d, then run maxclaude from a plain shell." >&2
+    return 1
+  fi
+  local name="tmp-$$"
+  # Set aside any stuck server first, or zellij's create below would hang on it.
+  _maxclaude_zj live >/dev/null
+  # Tear the session down even if the SSH connection drops: linger is on for this
+  # user, so the detached zellij server would otherwise outlive the disconnect.
+  trap '_maxclaude_zj stop "$name" >/dev/null 2>&1' HUP INT TERM
+  "$ZJ" --layout cc1 attach --create "$name"
+  trap - HUP INT TERM
+  _maxclaude_zj stop "$name" >/dev/null 2>&1
+}
+
+_maxclaude_unhide_flag(){
+  local nm="$1"
+  case "$nm" in [1-4]) nm="max$nm" ;; esac
+  sed -i '/^MAXAGENT_HIDDEN=/d' "${XDG_CONFIG_HOME:-$HOME/.config}/maxagent/sessions/${nm}.env" 2>/dev/null
+  return 0
+}
+
+maxclaude(){
+  export COLORTERM="${COLORTERM:-truecolor}"
+  local ZJ="${MAXAGENT_ZELLIJ:-${MAXCLAUDE_ZELLIJ:-$HOME/.local/bin/zellij}}"
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude"
+
+  # No arguments -> a single, throwaway Claude pane that is never persisted (see
+  # _maxclaude_ephemeral). Any explicit arg keeps the numbered/named behavior.
+  if [ "$#" -eq 0 ]; then
+    _maxclaude_ephemeral
+    return
+  fi
+
+  local sel="${1:-4}"
+
+  # Subcommands that must work from anywhere, including inside a session.
+  case "$sel" in
+    hide|unhide)
+      MAXAGENT_DEFAULT_PROVIDER=claude MAXAGENT_SESSION_PREFIX=legacy MAXAGENT_APP=maxclaude "$(dirname "$0")/maxagent" "$@"
+      return ;;
+    ls|list)
+      _maxclaude_prune                       # purge dead/exited ghosts before listing
+      local names; names="$(_maxclaude_sessions)"
+      local stuck_rows; stuck_rows="$(_maxclaude_zj stuck)"
+      if [ -z "$names" ] && [ -z "$stuck_rows" ]; then echo "No maxclaude sessions."; return; fi
+      local i=0 nm tags orgtag pid since
+      echo "maxclaude sessions:"
+      while IFS= read -r nm; do
+        [ -z "$nm" ] && continue
+        i=$((i+1))
+        tags="running"                       # _maxclaude_sessions returns live sessions only
+        _maxclaude_is_boot_enabled "$nm" && tags="$tags, boot-persistent"
+        [ "$nm" = "${ZELLIJ_SESSION_NAME:-}" ] && tags="$tags, current"
+        orgtag="$(grep -m1 '^MAXCLAUDE_ORG=' "$cfg/sessions/${nm}.env" 2>/dev/null | cut -d= -f2-)"
+        printf '  %2d) %-22s [%s]%s\n' "$i" "$nm" "$tags" "${orgtag:+ [$orgtag]}"
+      done <<< "$names"
+      local hidden_env hidden_nm hidden_list=""
+      for hidden_env in "${XDG_CONFIG_HOME:-$HOME/.config}"/maxagent/sessions/*.env; do
+        [ -e "$hidden_env" ] || continue
+        grep -qx 'MAXAGENT_HIDDEN=1' "$hidden_env" || continue
+        hidden_nm="$(basename "$hidden_env" .env)"
+        grep -qxF "$hidden_nm" <<<"$names" && continue
+        grep -qxF "$hidden_nm" <<<"$(cut -f1 <<<"$stuck_rows")" && continue
+        hidden_list="$hidden_list  $(printf '%-22s' "$hidden_nm") [$(grep -m1 '^MAXAGENT_PANES=' "$hidden_env" | cut -d= -f2-) panes]\n"
+      done
+      if [ -n "$hidden_list" ]; then echo "hidden:"; printf '%b' "$hidden_list"; fi
+      if [ -n "$stuck_rows" ]; then
+        echo "not responding (zellij cannot reach these; the sessions above are unaffected):"
+        while IFS=$'\t' read -r nm pid since; do
+          [ -n "$nm" ] || continue
+          printf '      %-22s [zellij server pid %s, stopped answering by %s]\n' "$nm" "${pid:-unknown}" "${since:-?}"
+        done <<< "$stuck_rows"
+        echo "  End one with: maxclaude close <name>    or keep its conversation with: maxclaude hide <name>"
+      fi
+      echo
+      echo "Attach: maxclaude attach <number>    Close: maxclaude close <number>    Hide: maxclaude hide <number|name>"
+      return ;;
+    prune|gc)
+      _maxclaude_prune
+      echo "Pruned dead sessions. Remaining:"
+      maxclaude ls
+      return ;;
+    kill)
+      local tgt="${2:-}"
+      if [ "$tgt" = "all" ]; then
+        local n u
+        for n in 1 2 3 4; do systemctl --user disable --now "maxclaude@${n}.service" >/dev/null 2>&1; done
+        systemctl --user list-units 'maxclaude-named@*' --all --no-legend 2>/dev/null | awk '{print $1}' \
+          | while read -r u; do systemctl --user disable --now "$u" >/dev/null 2>&1; done
+        { _maxclaude_sessions; _maxclaude_stuck_names; } | while IFS= read -r n; do
+          [ -n "$n" ] && _maxclaude_zj stop "$n" >/dev/null
+        done
+        _maxclaude_zj exited | while IFS= read -r n; do
+          [ -n "$n" ] && _maxclaude_zj forget "$n" >/dev/null 2>&1
+        done
+        echo "ALL maxclaude sessions stopped and removed from boot."
+        return
+      fi
+      # Alias for `close`: a bare number means the Nth session in `maxclaude ls`
+      # (same indexing as `close`/`attach`), NOT literally the session "maxN".
+      maxclaude close "$tgt"
+      return ;;
+    close)
+      local tgt="${2:-}"
+      case "$tgt" in all) maxclaude kill all; return ;; esac
+      [ -z "$tgt" ] && tgt="${ZELLIJ_SESSION_NAME:-}"
+      if [ -z "$tgt" ]; then
+        echo "usage: maxclaude close <number|name|all>  (no arg = current session)" >&2
+        maxclaude ls
+        return 2
+      fi
+      # A pure number means "the Nth session from 'maxclaude ls'".
+      case "$tgt" in
+        ''|*[!0-9]*) ;;                       # has a non-digit -> treat as a name
+        *)
+          local nm; nm="$(_maxclaude_sessions | awk -v n="$tgt" 'NR==n')"
+          if [ -z "$nm" ]; then
+            echo "No session #${tgt}." >&2
+            maxclaude ls >&2
+            return 2
+          fi
+          tgt="$nm"
+          ;;
+      esac
+      _maxclaude_close "$tgt"
+      return ;;
+    attach|a|re|reattach)
+      local tgt="${2:-}"
+      if [ -z "$tgt" ]; then
+        echo "usage: maxclaude attach <number|name>  (number from 'maxclaude ls')" >&2
+        maxclaude ls
+        return 2
+      fi
+      # A pure number means "the Nth session from 'maxclaude ls'" (same index as close).
+      case "$tgt" in
+        ''|*[!0-9]*) ;;                       # has a non-digit -> treat as a name
+        *)
+          local nm; nm="$(_maxclaude_sessions | awk -v n="$tgt" 'NR==n')"
+          if [ -z "$nm" ]; then
+            echo "No session #${tgt}." >&2
+            maxclaude ls >&2
+            return 2
+          fi
+          tgt="$nm"
+          ;;
+      esac
+      _maxclaude_refuse_stuck "$tgt" || return 1
+      _maxclaude_unhide_flag "$tgt"
+      _maxclaude_open "$tgt"
+      return ;;
+  esac
+
+  # Create-or-attach the requested numbered/named session. `_maxclaude_open` uses
+  # `systemctl --user start` (never enable), so sessions survive SSH disconnect
+  # via linger but never respawn on boot.
+  _maxclaude_unhide_flag "$sel"
+  _maxclaude_open "$sel" "${2:-}"
+}
+
+maxclaude "$@"

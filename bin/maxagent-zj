@@ -19,6 +19,14 @@
 #   maxagent-zj stop <name>    end a session, make sure its server exits, delete its resurrection data
 #   maxagent-zj forget <name>  delete a session's resurrection data
 #   maxagent-zj watch          check every session, and recheck the stuck ones (for a timer)
+#   maxagent-zj list [opts]    zellij list-sessions [opts] under a deadline; a server that
+#                              stops answering is set aside and left out of the list
+#   maxagent-zj run <name> <zellij args...>
+#                              zellij --session <name> <args>, sent to that session's server
+#                              alone under a deadline. Exit status: zellij's own; 1 when no
+#                              session has that name; 69 when the session is not responding
+#                              (named on stderr and in the log); 124 when the call ran past
+#                              the deadline although the server still answers.
 
 set -uo pipefail
 unset ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID
@@ -32,6 +40,8 @@ fi
 APP="${MAXAGENT_APP:-maxagent}"
 PROBE_SECS="${MAXAGENT_ZJ_PROBE_SECONDS:-3}"
 STOP_SECS="${MAXAGENT_ZJ_STOP_SECONDS:-10}"
+RUN_SECS="${MAXAGENT_ZJ_RUN_SECONDS:-10}"
+LIST_SECS="${MAXAGENT_ZJ_LIST_SECONDS:-5}"
 PARALLEL="${MAXAGENT_ZJ_PARALLEL:-16}"
 
 # zellij's socket directory: $ZELLIJ_SOCKET_DIR, else $XDG_RUNTIME_DIR/zellij
@@ -94,7 +104,8 @@ _limit(){
 # Run zellij with its discovery limited to one socket, or to none when the
 # socket is "". zellij sees the socket through a hard link in a private
 # directory, so no other server is contacted.
-#   _zj_scoped <secs> <socket path|""> <out file> <zellij args...>
+#   _zj_scoped <secs> <socket path|""> <out file|-> <zellij args...>
+# With "-" zellij writes to this script's stdout and stderr.
 # Exit status: zellij's, 124 or 137 on deadline, 125 when the socket could not
 # be linked, 126 when the private directory could not be made. On 0 to 123 the
 # global LINK_GONE is 1 when zellij removed the link because nothing listens.
@@ -112,7 +123,11 @@ _zj_scoped(){
       return 125
     fi
   fi
-  _limit "$secs" env ZELLIJ_SOCKET_DIR="$view" "$ZJ" "$@" >"$out" 2>&1 </dev/null
+  if [ "$out" = - ]; then
+    _limit "$secs" env ZELLIJ_SOCKET_DIR="$view" "$ZJ" "$@" </dev/null
+  else
+    _limit "$secs" env ZELLIJ_SOCKET_DIR="$view" "$ZJ" "$@" >"$out" 2>&1 </dev/null
+  fi
   rc=$?
   if [ -n "$name" ] && [ ! -e "$view/$CONTRACT/$name" ]; then
     LINK_GONE=1
@@ -347,6 +362,88 @@ _watch(){
   done < <(_stuck)
 }
 
+_is_stuck(){ _stuck | cut -f1 | grep -qxF -- "$1"; }
+
+_stuck_message(){
+  local name="$1" pid since
+  pid="$(_info "$name" pid)"
+  since="$(_info "$name" since)"
+  echo "$APP: session '$name' is not responding: its zellij server (pid ${pid:-unknown}) stopped answering${since:+ by $since}. End it with: $APP close $name" >&2
+}
+
+# zellij list-sessions under a deadline. Past the deadline, every server that
+# stopped answering is set aside and the list is asked for once more.
+_list(){
+  local out err rc try
+  out="$(mktemp)" || return 1
+  err="$(mktemp)" || { rm -f "$out"; return 1; }
+  for try in 1 2; do
+    : "$try"
+    _limit "$LIST_SECS" "$ZJ" list-sessions "$@" >"$out" 2>"$err" </dev/null
+    rc=$?
+    case "$rc" in
+      124|137) _scan >/dev/null ;;
+      *) cat "$out"; cat "$err" >&2; rm -f "$out" "$err"; return "$rc" ;;
+    esac
+  done
+  rm -f "$out" "$err"
+  _log "zellij list-sessions did not finish within ${LIST_SECS}s, twice, although every zellij server that stopped answering was set aside"
+  return 124
+}
+
+# One zellij command for one session, sent to that session's server alone under
+# a deadline. A server that misses the deadline and then two probes is set aside.
+_run(){
+  local name="$1" sock rc state
+  shift
+  sock="$SOCK_DIR/$name"
+  if [ ! -S "$sock" ]; then
+    if _is_stuck "$name"; then
+      _stuck_message "$name"
+      return 69
+    fi
+    echo "$APP: no running zellij session named '$name'" >&2
+    return 1
+  fi
+  _zj_scoped "$RUN_SECS" "$sock" - --session "$name" "$@"
+  rc=$?
+  case "$rc" in
+    124|137) ;;
+    125|126)
+      echo "$APP: could not reach zellij session '$name' through a private socket directory" >&2
+      return "$rc" ;;
+    *) return "$rc" ;;
+  esac
+  # Another caller may have set the socket aside while this call waited.
+  if [ ! -S "$sock" ] && _is_stuck "$name"; then
+    _stuck_message "$name"
+    return 69
+  fi
+  state="$(_probe "$sock")"
+  [ "$state" = noreply ] && state="$(_probe "$sock")"
+  case "$state" in
+    noreply)
+      if ! _set_aside "$name"; then
+        if _is_stuck "$name"; then
+          _stuck_message "$name"
+        else
+          _log "session '$name' is not responding: its zellij server did not answer within ${PROBE_SECS}s, twice, and its socket could not be moved aside"
+        fi
+      fi
+      return 69 ;;
+    gone)
+      if _is_stuck "$name"; then
+        _stuck_message "$name"
+        return 69
+      fi
+      echo "$APP: zellij session '$name' ended while 'zellij $*' ran" >&2
+      return 1 ;;
+    *)
+      echo "$APP: 'zellij $*' did not finish within ${RUN_SECS}s on session '$name'; its zellij server still answers" >&2
+      return 124 ;;
+  esac
+}
+
 cmd="${1:-}"
 case "$cmd" in
   live) _live ;;
@@ -356,5 +453,9 @@ case "$cmd" in
   stop) [ -n "${2:-}" ] || { echo "usage: maxagent-zj stop <name>" >&2; exit 2; }; _stop "$2" ;;
   forget) [ -n "${2:-}" ] || { echo "usage: maxagent-zj forget <name>" >&2; exit 2; }; _forget "$2" ;;
   watch) _watch ;;
-  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  list) shift; _list "$@" ;;
+  run)
+    if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then echo "usage: maxagent-zj run <name> <zellij args...>" >&2; exit 2; fi
+    shift; _run "$@" ;;
+  *) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

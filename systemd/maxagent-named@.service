@@ -7,7 +7,7 @@ After=default.target
 Type=oneshot
 RemainAfterExit=yes
 KillMode=process
-# Start and stop never wait forever. maxagent-svc checks sessions through
+# Start and stop never wait forever. The svc script checks sessions through
 # maxagent-zj; these limits cover anything else that could block.
 TimeoutStartSec=90
 TimeoutStopSec=60

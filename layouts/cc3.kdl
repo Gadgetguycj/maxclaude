@@ -1,0 +1,16 @@
+// maxclaude 3 - one tall pane on the left, right column split top/bottom.
+layout {
+    pane_template name="cc" {
+        command "bash"
+        args "-lc" "exec $HOME/.local/bin/maxclaude-pane"
+    }
+    tab name="claude" focus=true {
+        pane split_direction="vertical" {
+            cc
+            pane split_direction="horizontal" {
+                cc
+                cc
+            }
+        }
+    }
+}
