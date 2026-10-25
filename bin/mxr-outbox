@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Stop-hook for maxrouter workers: drop the last assistant reply into
+# <config>/router/outbox/<session_id>.json so mxr send can pick it up.
+# Must ALWAYS exit 0; a broken hook must never block a worker's turn.
+set -euo pipefail
+
+IN=$(cat 2>/dev/null || true)
+[ -n "$IN" ] || exit 0
+
+SID=$(jq -r '.session_id // empty' <<<"$IN" 2>/dev/null || true)
+[ -n "$SID" ] || exit 0
+
+# Preferred: Stop-hook stdin carries the final text directly (claude 2.1.172).
+TEXT=$(jq -r '.last_assistant_message // empty' <<<"$IN" 2>/dev/null || true)
+
+# Fallback: parse the transcript jsonl (may lag behind the final message).
+if [ -z "$TEXT" ]; then
+  TRANSCRIPT=$(jq -r '.transcript_path // empty' <<<"$IN" 2>/dev/null || true)
+  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    TEXT=$(jq -rs '
+      [ .[] | select(.type == "assistant")
+        | [ .message.content[]? | select(.type == "text") | .text ] | join("")
+        | select(length > 0) ]
+      | last // ""
+    ' "$TRANSCRIPT" 2>/dev/null || true)
+  fi
+fi
+
+CFG="${MAXROUTER_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/maxclaude}"
+OUTDIR="$CFG/router/outbox"
+mkdir -p "$OUTDIR" 2>/dev/null || exit 0
+
+# Atomic write: mxr polls this file's mtime and must never read a partial JSON.
+TMP=$(mktemp "$OUTDIR/.${SID}.XXXXXX" 2>/dev/null) || exit 0
+if jq -n --arg ts "$(date -Is)" --arg sid "$SID" --arg text "$TEXT" \
+    '{ts: $ts, sid: $sid, text: $text}' > "$TMP" 2>/dev/null; then
+  mv -f "$TMP" "$OUTDIR/$SID.json" 2>/dev/null || rm -f "$TMP"
+else
+  rm -f "$TMP"
+fi
+
+exit 0

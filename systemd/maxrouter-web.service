@@ -1,0 +1,10 @@
+[Unit]
+Description=maxrouter web GUI
+
+[Service]
+ExecStart=%h/.local/bin/maxrouter-webd
+Restart=on-failure
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
